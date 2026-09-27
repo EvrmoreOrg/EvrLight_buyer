@@ -10,7 +10,7 @@ offer at a quantity within the range set by the seller. After a buyer communicat
 desired to take a seller's offer and chooses the quantity they want to purchase, they are shown 
 a lightning invoice as a QRCode. The buyer can scan the QRCode using any Lightning wallet to pay 
 with Bitcoin or scan using Block Inc's CashApp to pay with Dollars. The purchased asset is then 
-automatically delivered to them. Typically within 4 seconds the buyer receives notification that the 
+automatically delivered to them. Typically within 4 seconds the buyer receives motification that the 
 contract transaction broadcast has appeared in the explorer's mempool. This is sufficient for 
 small-value transactions. Final confirmation of the contract and sweep delivery transactions by 
 miners typically takes just over 2 minutes. It is a simple process.
@@ -46,6 +46,21 @@ EvrLight is designed to be quite robust against a variety of errors. Settlment o
 invoice in which the buyer pays for the assets is delayed until delivery of the assests
 is confirmed on-chain. If any part of the process fails, the invoice is cancelled and
 payment is never accepted from the buyer.
+
+The EvrLight buyer webpage needs no installation since it is static code. Just copy the
+contents of this repository directly into your webserver
+
+As mentioned earlier, the buyer.html web page can be passed some arguments supplied as query
+commands in the URL used to access the page. As a buyer, this is of no interest to you since 
+you simply click on a link which might look like:
+
+*https://example.com/buyer.html?set=*
+*eEe8M8AsGPe-YAi2T9vFTQxusCHFLU-342sEqlLH30cIe7xokTJDsf9gArEZhdMKVj68aJEtQ7b1YQrnZg*
+
+As a merchant who prepares those links for inclusion in advertisements or social media
+postings, you will need to decide how to generate that link from the arguments you need.
+Documentation for that is included in the script "settings-blob-tool.js"
+
 
 Buyer.html will soon be made available also as a headless Node.js module. This will make
 it easy to embed EvrLight buyer functionality into other applications which integrate
