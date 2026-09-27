@@ -1,0 +1,2039 @@
+<!-- version=a339f833 -->
+<!-- Copyright (c) 2026 Hans Schmidt - All rights reserved -->
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <script src="https://bundle.run/buffer@6.0.3"></script>
+    <script>var Buffer = buffer.Buffer</script>
+    <script src="evrmorejs-lib.js"></script>
+    <script src="ecpair.js"></script>
+    <script>evrmorejs.ECPair = ECPair</script>
+    <script src="https://bundle.run/noble-secp256k1@1.2.14"></script>
+    <script src="https://bundle.run/browserify-cipher@1.0.1"></script>
+    
+    <script src="nip44-deps.js"></script>
+    <script src="bolt11.js"></script>
+    <script src="qrcode.js"></script>
+    <style>*{box-sizing:border-box;font-size:1.15rem;font-family:Arial,sans-serif}html{max-width:100%;padding:3rem 1rem;margin:auto;line-height:1.25}h1,h2,p{max-width:70ch}h1{font-size:2rem}h2{font-size:1.5rem}input{line-height:1.25;width:100%;height:1.8rem;font-size:1.15rem;border:1px solid grey}.orderbook-table{width:100%;border-collapse:collapse;margin-bottom:1rem;font-size:.95rem}.orderbook-table td,.orderbook-table th{border:1px solid #000;padding:.5rem;text-align:left}.orderbook-table tbody tr{cursor:pointer}.orderbook-table tbody tr:hover{background-color:#f2f2f2}.black-bg{display:none;width:100%;position:fixed;top:0;left:0;background-color:#000;opacity:.5;width:100vw;height:100vh}.modal{display:none;position:fixed;box-sizing:border-box;top:50%;left:50%;transform:translate(-50%,-50%);width:100%;max-width:560px;background-color:#fff;border-radius:1rem;padding:20px;color:#000;text-align:center;word-wrap:break-word;font-size:.75rem;line-height:1.3;max-height:85vh;overflow:auto;resize:both}.modal h2{font-size:1.05rem;margin:0 0 .4em}.modal p{margin:.35em 0}.modal input{font-size:.85rem;height:1.6rem}.compact-modal-content{font-size:.75rem;line-height:1.3}.compact-modal-content h2{font-size:1.05rem;margin:0 0 .4em}.compact-modal-content p{margin:.35em 0}.compact-modal-content td{padding:.3rem!important}.settings-btn{position:fixed;top:1rem;left:1rem;padding:.4rem .9rem;font-size:.85rem;cursor:pointer;border:1px solid #000;border-radius:.5rem;background:#fff;color:#000;z-index:10}</style>
+  </head>
+  <body>
+    <button class="settings-btn">Settings</button>
+    <h2>Bitcoin Lightning to Evrmore On-Chain Swap Service</h2>
+    <p>Pay L-sats on Bitcoin Lightning Network to receive EVR or Evrmore assets on the Evrmore base layer</p>
+    <h2>Sell Offers</h2>
+    <div style="overflow-x:auto">
+      <table class="orderbook-table">
+        <thead>
+          <tr>
+            <th>Coin</th>
+            <th>Exchange Rate</th>
+            <th>Min Qty</th>
+            <th>Max Qty</th>
+            <th>Service</th>
+            <th>Seller</th>
+            <th>Status</th>
+            <th>Created (UTC)</th>
+          </tr>
+        </thead>
+        <tbody class="orderbook"></tbody>
+      </table>
+    </div>
+    <h2>Price Suggestion</h2>
+    <div style="overflow-x:auto">
+      <table class="orderbook-table">
+        <thead>
+          <tr>
+            <th>Coin</th>
+            <th>Exchange Rate</th>
+            <th>Qty</th>
+            <th>Time-UTC</th>
+          </tr>
+        </thead>
+        <tbody class="price-suggestion-row">
+          <tr>
+            <td class="buy-coin"></td>
+            <td class="buy-rate"></td>
+            <td class="buy-qty"></td>
+            <td class="buy-time"></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem">
+      <label class="buy-coin-entry">Coin
+        <input class="buy-coin-input" placeholder="EVR or asset name" style="width:10rem">
+      </label>
+      <label>Exchange Rate (<span class="buy-coin-label">Coin</span> per BTC)
+        <input type="number" class="buy-rate-input" min="0" step="any" style="width:10rem">
+      </label>
+      <label>Qty (<span class="buy-coin-label">Coin</span>)
+        <input type="number" class="buy-qty-input" min="0" step="any" style="width:10rem">
+      </label>
+      <button class="broadcast-price-suggestion-btn">Broadcast suggestion</button>
+      <button class="clear-price-suggestion-btn" style="display:none">Clear</button>
+    </div>
+    <p style="font-size:.75rem">Suggestions to sellers are not offers.</p>
+    <script>(function() {
+    var _originalConsoleLog = console.log;
+    console.log = function() {
+        var args = Array.prototype.slice.call(arguments);
+        _originalConsoleLog.apply(console, [ "[" + (new Date).toISOString() + "]" ].concat(args));
+    };
+})();
+
+var DEFAULT_CONFIG = {
+    relay: "wss://nostr4evr.evrmorecoin.org",
+    network: "testnet",
+    buyer_privkey: "",
+    coin: "",
+    seller_keys: ""
+};
+
+function normalizeRelayURL(e) {
+    let [t, ...r] = e.trim().split("?");
+    return "http" === t.slice(0, 4) && (t = "ws" + t.slice(4)), "ws" !== t.slice(0, 2) && (t = "wss://" + t), 
+    t.length && "/" === t[t.length - 1] && (t = t.slice(0, -1)), [ t, ...r ].join("?");
+}
+
+function parseRelayList(raw) {
+    return (raw || "").split(",").map(function(s) {
+        return s.trim();
+    }).filter(Boolean).map(normalizeRelayURL);
+}
+
+function parseBunkerConnectString(value) {
+    try {
+        var url = new URL(value);
+        if (url.protocol !== "bunker:") return null;
+        var pubkey = (url.hostname || url.pathname.replace(/^\/+/, "")).toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(pubkey)) return null;
+        var relays = url.searchParams.getAll("relay").map(function(s) {
+            return s.trim();
+        }).filter(Boolean).map(normalizeRelayURL);
+        if (relays.length === 0) return null;
+        return {
+            remoteSignerPubkey: pubkey,
+            relays: relays,
+            secret: url.searchParams.get("secret") || ""
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+var SETTINGS_OBFUSCATION_KEY = new Uint8Array([ 122, 28, 158, 68, 179, 95, 34, 216, 145, 14, 103, 197, 59, 169, 241, 40 ]);
+
+var SETTINGS_BLOB_VERSION = 1;
+
+function lzwCompress(input) {
+    var dictionary = {};
+    for (var i = 0; i < 256; i++) dictionary[String.fromCharCode(i)] = i;
+    var nextCode = 256;
+    var current = "";
+    var output = [];
+    for (var j = 0; j < input.length; j++) {
+        var combined = current + input[j];
+        if (Object.prototype.hasOwnProperty.call(dictionary, combined)) current = combined; else {
+            output.push(dictionary[current]);
+            if (nextCode < 65536) dictionary[combined] = nextCode++;
+            current = input[j];
+        }
+    }
+    if (current !== "") output.push(dictionary[current]);
+    return output;
+}
+
+function lzwDecompress(codes) {
+    if (codes.length === 0) return "";
+    var dictionary = {};
+    for (var i = 0; i < 256; i++) dictionary[i] = String.fromCharCode(i);
+    var nextCode = 256;
+    var current = dictionary[codes[0]];
+    if (current === void 0) throw new Error("lzw: invalid first code " + codes[0]);
+    var output = current;
+    for (var j = 1; j < codes.length; j++) {
+        var code = codes[j];
+        var entry;
+        if (Object.prototype.hasOwnProperty.call(dictionary, code)) entry = dictionary[code]; else if (code === nextCode) entry = current + current.charAt(0); else throw new Error("lzw: invalid code " + code);
+        output += entry;
+        if (nextCode < 65536) dictionary[nextCode++] = current + entry.charAt(0);
+        current = entry;
+    }
+    return output;
+}
+
+function codesToBytes(codes) {
+    var bytes = new Uint8Array(codes.length * 2);
+    for (var i = 0; i < codes.length; i++) {
+        bytes[i * 2] = codes[i] >> 8 & 255;
+        bytes[i * 2 + 1] = codes[i] & 255;
+    }
+    return bytes;
+}
+
+function bytesToCodes(bytes) {
+    var codes = [];
+    for (var i = 0; i < bytes.length; i += 2) codes.push(bytes[i] << 8 | bytes[i + 1]);
+    return codes;
+}
+
+function xorBytes(bytes, key) {
+    var out = new Uint8Array(bytes.length);
+    for (var i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ key[i % key.length];
+    return out;
+}
+
+function bytesToBase64Url(bytes) {
+    var chunkSize = 8192;
+    var binary = "";
+    for (var i = 0; i < bytes.length; i += chunkSize) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlToBytes(b64url) {
+    var b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    var binary = atob(b64);
+    var out = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+}
+
+function stringToRawBytes(str) {
+    var bytes = new Uint8Array(str.length);
+    for (var i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 255;
+    return bytes;
+}
+
+function rawBytesToString(bytes) {
+    var chars = [];
+    for (var i = 0; i < bytes.length; i++) chars.push(String.fromCharCode(bytes[i]));
+    return chars.join("");
+}
+
+function encodeSettingsBlob(relay, network, coin, seller_keys, buyerPrivkeySentinel) {
+    var json = JSON.stringify([ relay, network, coin, seller_keys, buyerPrivkeySentinel || "" ]);
+    var compressedBytes = codesToBytes(lzwCompress(json));
+    var rawBytes = stringToRawBytes(json);
+    var useCompression = compressedBytes.length < rawBytes.length;
+    var payload = useCompression ? compressedBytes : rawBytes;
+    var header = SETTINGS_BLOB_VERSION << 1 | (useCompression ? 1 : 0);
+    var withHeader = new Uint8Array(1 + payload.length);
+    withHeader[0] = header;
+    withHeader.set(payload, 1);
+    return bytesToBase64Url(xorBytes(withHeader, SETTINGS_OBFUSCATION_KEY));
+}
+
+function decodeSettingsBlob(setParam) {
+    try {
+        var withHeader = xorBytes(base64UrlToBytes(setParam), SETTINGS_OBFUSCATION_KEY);
+        if (withHeader.length < 1) throw new Error("empty settings blob");
+        var version = withHeader[0] >> 1;
+        var isCompressed = (withHeader[0] & 1) === 1;
+        if (version !== SETTINGS_BLOB_VERSION) throw new Error("unrecognized settings blob version " + version);
+        var payload = withHeader.subarray(1);
+        var json;
+        if (isCompressed) {
+            if (payload.length % 2 !== 0) throw new Error("corrupt compressed payload (odd code-byte length)");
+            json = lzwDecompress(bytesToCodes(payload));
+        } else json = rawBytesToString(payload);
+        var parsed = JSON.parse(json);
+        if (!Array.isArray(parsed) || parsed.length !== 5 || !parsed.every(function(v) {
+            return typeof v === "string";
+        })) throw new Error("decoded settings blob has an unexpected shape");
+        return {
+            relay: parsed[0],
+            network: parsed[1],
+            coin: parsed[2],
+            seller_keys: parsed[3],
+            buyer_privkey: parsed[4]
+        };
+    } catch (e) {
+        console.error('decodeSettingsBlob: failed to decode "set=" param:', e.message);
+        return null;
+    }
+}
+
+function decodeNsec(nsecStr) {
+    var CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    function polymod(values) {
+        var GEN = [ 996825010, 642813549, 513874426, 1027748829, 705979059 ];
+        var chk = 1;
+        for (var p = 0; p < values.length; p++) {
+            var top = chk >>> 25;
+            chk = (chk & 33554431) << 5 ^ values[p];
+            for (var i = 0; i < 5; i++) if (top >>> i & 1) chk ^= GEN[i];
+        }
+        return chk >>> 0;
+    }
+    function hrpExpand(hrp) {
+        var ret = [];
+        for (var i = 0; i < hrp.length; i++) ret.push(hrp.charCodeAt(i) >> 5);
+        ret.push(0);
+        for (var i2 = 0; i2 < hrp.length; i2++) ret.push(hrp.charCodeAt(i2) & 31);
+        return ret;
+    }
+    try {
+        nsecStr = nsecStr.trim().toLowerCase();
+        var sep = nsecStr.lastIndexOf("1");
+        if (sep < 1 || sep + 7 > nsecStr.length) return null;
+        var hrp = nsecStr.slice(0, sep);
+        if (hrp !== "nsec") return null;
+        var dataPart = nsecStr.slice(sep + 1);
+        var values = [];
+        for (var i = 0; i < dataPart.length; i++) {
+            var idx = CHARSET.indexOf(dataPart[i]);
+            if (idx === -1) return null;
+            values.push(idx);
+        }
+        if (polymod(hrpExpand(hrp).concat(values)) !== 1) return null;
+        var words = values.slice(0, -6);
+        var acc = 0, bits = 0, bytes = [];
+        for (var w = 0; w < words.length; w++) {
+            acc = (acc << 5 | words[w]) >>> 0;
+            bits += 5;
+            if (bits >= 8) {
+                bits -= 8;
+                bytes.push(acc >>> bits & 255);
+            }
+        }
+        if (bytes.length !== 32) return null;
+        return bytes.map(function(b) {
+            return b.toString(16).padStart(2, "0");
+        }).join("");
+    } catch (e) {
+        return null;
+    }
+}
+
+function isUrlSafeBuyerPrivkeySentinel(value) {
+    return value === "random" || value === "NIP-07_Extension";
+}
+
+function isNip07Available() {
+    return !!(window.nostr && typeof window.nostr.getPublicKey === "function");
+}
+
+function resolveBuyerPrivkey(buyerPrivkeyField) {
+    if (!buyerPrivkeyField || buyerPrivkeyField === "random") return Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+    var trimmed = buyerPrivkeyField.trim();
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) return trimmed.toLowerCase();
+    var decoded = decodeNsec(trimmed);
+    if (decoded) return decoded;
+    alert("Couldn't parse the private key you entered (expected 64 hex characters or an nsec1... key) -- using a freshly generated random identity instead.");
+    return Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+}
+
+var BUYER_PRIVKEY_STORAGE_KEY = "buyer_privkey";
+
+function loadPersistedBuyerPrivkey() {
+    try {
+        return localStorage.getItem(BUYER_PRIVKEY_STORAGE_KEY) || "";
+    } catch (e) {
+        return "";
+    }
+}
+
+function persistBuyerPrivkey(value) {
+    try {
+        localStorage.setItem(BUYER_PRIVKEY_STORAGE_KEY, value);
+    } catch (e) {}
+}
+
+function clearPersistedBuyerPrivkey() {
+    try {
+        localStorage.removeItem(BUYER_PRIVKEY_STORAGE_KEY);
+    } catch (e) {}
+}
+
+var NIP46_CLIENT_KEY_STORAGE_KEY = "nip46_client_key";
+
+function loadPersistedNip46ClientKey() {
+    try {
+        return localStorage.getItem(NIP46_CLIENT_KEY_STORAGE_KEY) || "";
+    } catch (e) {
+        return "";
+    }
+}
+
+function persistNip46ClientKey(value) {
+    try {
+        localStorage.setItem(NIP46_CLIENT_KEY_STORAGE_KEY, value);
+    } catch (e) {}
+}
+
+function clearNip46ClientKey() {
+    try {
+        localStorage.removeItem(NIP46_CLIENT_KEY_STORAGE_KEY);
+    } catch (e) {}
+}
+
+var BUYER_SETTINGS_STORAGE_KEY = "buyer_settings";
+
+function loadPersistedBuyerSettings() {
+    try {
+        var raw = localStorage.getItem(BUYER_SETTINGS_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function persistBuyerSettings(settings) {
+    try {
+        localStorage.setItem(BUYER_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    } catch (e) {}
+}
+
+var HTLC_MASTER_KEY_STORAGE_KEY = "htlc_master_key";
+
+function loadPersistedHtlcMasterKey() {
+    try {
+        return localStorage.getItem(HTLC_MASTER_KEY_STORAGE_KEY) || "";
+    } catch (e) {
+        return "";
+    }
+}
+
+function persistHtlcMasterKey(value) {
+    try {
+        localStorage.setItem(HTLC_MASTER_KEY_STORAGE_KEY, value);
+    } catch (e) {}
+}
+
+function clearHtlcMasterKey() {
+    try {
+        localStorage.removeItem(HTLC_MASTER_KEY_STORAGE_KEY);
+    } catch (e) {}
+}
+
+function getOrCreateHtlcMasterKey() {
+    var existing = loadPersistedHtlcMasterKey();
+    if (existing) return existing;
+    var fresh = Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+    persistHtlcMasterKey(fresh);
+    return fresh;
+}
+
+function showConfigDialog(config) {
+    return new Promise(function(resolve) {
+        var modal = document.querySelector(".modal");
+        var blackBg = document.querySelector(".black-bg");
+        modal.style.maxWidth = "500px";
+        modal.style.textAlign = "left";
+        var hasPersistedPrivkey = !!loadPersistedBuyerPrivkey();
+        modal.innerHTML = `\n            <h2 style="margin-top: 0;">Connection settings</h2>\n            <div class="config-locked-fields">\n              <p>Relay (comma-separated for more than one)</p>\n              <p><input class="config-relay" style="width: 100%;"></p>\n              <p>Network</p>\n              <p><select class="config-network" style="width: 100%;">\n                <option value="testnet">testnet</option>\n                <option value="mainnet">mainnet</option>\n              </select></p>\n            </div>\n            <p>Your Nostr identity -- a persistent key is recommended (it lets you recover an\n              in-progress swap even if this browser tab is lost, closed, or crashes); type\n              <strong>random</strong> instead if you'd rather use a fresh, unlinkable identity every\n              visit, or paste a NIP-46 <strong>bunker://...</strong> connect string to use a remote\n              signer instead of typing a key here at all</p>\n            <p style="display: flex; gap: 0.5rem;">\n              <input class="config-privkey" type="password" style="flex: 1;">\n              <button type="button" class="config-privkey-toggle" style="padding: 0 0.6rem; cursor: pointer;">Show</button>\n            </p>\n            <p style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem;">\n              <input type="checkbox" class="config-remember-privkey" id="config-remember-privkey" style="margin: 0;">\n              <label for="config-remember-privkey">Remember this identity on this device</label>\n            </p>\n            <p style="font-size: 0.75rem; color: #a00;">⚠ If checked, this key (or, for a bunker\n              connect string, both the string itself and a paired local connection key) is stored\n              unencrypted in this browser's local storage and stays there until you clear it (by\n              unchecking this box and continuing, or clearing site data). Only enable this on a device\n              you trust.</p>\n            <p style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem;">\n              <input type="checkbox" class="config-use-nip07" id="config-use-nip07" style="margin: 0;">\n              <label for="config-use-nip07">Use a Nostr browser extension (NIP-07) instead of a key\n                above</label>\n            </p>\n            <p>HTLC recovery key -- independent of the identity above; lets you reconstruct a past\n              swap's on-chain claim key later (e.g. if this tab is lost mid-swap). Backed up\n              automatically to this device; view or rotate it here if you ever need to.</p>\n            <p style="display: flex; gap: 0.5rem;">\n              <input class="config-htlc-master-key" type="password" readonly style="flex: 1;">\n              <button type="button" class="config-htlc-master-key-toggle" style="padding: 0 0.6rem; cursor: pointer;">Show</button>\n              <button type="button" class="config-htlc-master-key-rotate" style="padding: 0 0.6rem; cursor: pointer;">Rotate</button>\n            </p>\n            <div class="config-locked-fields">\n              <p>Coin (blank = show every offer; "EVR" or an asset name filters everything to just that one)</p>\n              <p><input class="config-coin" style="width: 100%;"></p>\n              <p>Seller pubkeys (blank = show every seller; comma-separated for more than one)</p>\n              <p><input class="config-seller-keys" style="width: 100%;"></p>\n            </div>\n            <div style="display: flex; justify-content: center; margin-top: 1rem;">\n              <button class="config-continue-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">Continue</button>\n            </div>\n          `;
+        modal.querySelector(".config-relay").value = config.relay;
+        modal.querySelector(".config-network").value = config.network;
+        modal.querySelectorAll(".config-locked-fields").forEach(function(div) {
+            div.style.display = config._fromObfuscatedUrl ? "none" : "";
+        });
+        var usingNip07 = config.buyer_privkey === "NIP-07_Extension";
+        modal.querySelector(".config-privkey").value = usingNip07 ? "" : config.buyer_privkey;
+        modal.querySelector(".config-remember-privkey").checked = hasPersistedPrivkey;
+        modal.querySelector(".config-use-nip07").checked = usingNip07;
+        modal.querySelector(".config-privkey").disabled = usingNip07;
+        modal.querySelector(".config-coin").value = config.coin;
+        modal.querySelector(".config-seller-keys").value = config.seller_keys;
+        modal.querySelector(".config-use-nip07").onchange = function() {
+            modal.querySelector(".config-privkey").disabled = this.checked;
+        };
+        modal.querySelector(".config-htlc-master-key").value = getOrCreateHtlcMasterKey();
+        [ ".config-privkey", ".config-htlc-master-key" ].forEach(function(selector) {
+            modal.querySelector(selector + "-toggle").onclick = function() {
+                var field = modal.querySelector(selector);
+                var showing = field.type === "text";
+                field.type = showing ? "password" : "text";
+                this.textContent = showing ? "Show" : "Hide";
+            };
+        });
+        modal.querySelector(".config-htlc-master-key-rotate").onclick = function() {
+            if (!confirm("Rotate your HTLC recovery key? Any swap you haven't finished recovering with the CURRENT key will no longer be reconstructible from it afterward -- only do this if you're sure nothing is still pending. The page will reload.")) return;
+            clearHtlcMasterKey();
+            getOrCreateHtlcMasterKey();
+            location.reload();
+        };
+        blackBg.style.display = "block";
+        modal.style.display = "block";
+        modal.querySelector(".config-continue-btn").onclick = function() {
+            var useNip07 = modal.querySelector(".config-use-nip07").checked;
+            var buyerPrivkeyValue;
+            if (useNip07) {
+                if (!window.nostr || typeof window.nostr.getPublicKey !== "function") {
+                    alert("No compatible Nostr browser extension was found (window.nostr is missing). Install one (e.g. nos2x, Alby) and try again, or uncheck that box to use a key instead.");
+                    return;
+                }
+                buyerPrivkeyValue = "NIP-07_Extension";
+            } else {
+                buyerPrivkeyValue = modal.querySelector(".config-privkey").value.trim();
+                if (!buyerPrivkeyValue) {
+                    alert('Please enter your Nostr identity: type "random" for a fresh, unlinkable identity every visit, paste a 64-character hex key / nsec1... key to use a persistent one, a bunker://... connect string to use a NIP-46 remote signer, or check the box above to use a browser extension instead.');
+                    return;
+                }
+                if (/^bunker:\/\//i.test(buyerPrivkeyValue) && !parseBunkerConnectString(buyerPrivkeyValue)) {
+                    alert("That doesn't look like a valid NIP-46 bunker connect string. Expected: bunker://<64-char-hex-pubkey>?relay=<url>[&relay=<url2>][&secret=<secret>]");
+                    return;
+                }
+            }
+            var rememberPrivkey = modal.querySelector(".config-remember-privkey").checked;
+            if (rememberPrivkey) {
+                persistBuyerPrivkey(buyerPrivkeyValue);
+                if (/^bunker:\/\//i.test(buyerPrivkeyValue) && !loadPersistedNip46ClientKey()) persistNip46ClientKey(Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex"));
+            } else {
+                clearPersistedBuyerPrivkey();
+                clearNip46ClientKey();
+            }
+            var result = {
+                relay: modal.querySelector(".config-relay").value.trim(),
+                network: modal.querySelector(".config-network").value,
+                buyer_privkey: buyerPrivkeyValue,
+                coin: modal.querySelector(".config-coin").value.trim(),
+                seller_keys: modal.querySelector(".config-seller-keys").value.trim()
+            };
+            blackBg.style.display = "none";
+            modal.style.display = "none";
+            modal.style.maxWidth = "";
+            modal.style.textAlign = "";
+            resolve(result);
+        };
+    });
+}
+
+function resolveCurrentBuyerConfig() {
+    var params = new URLSearchParams(window.location.search);
+    var persisted = loadPersistedBuyerSettings();
+    var decodedSet = params.get("set") ? decodeSettingsBlob(params.get("set")) : null;
+    var config = decodedSet || {
+        relay: params.get("relay") || persisted.relay || DEFAULT_CONFIG.relay,
+        network: params.get("network") || persisted.network || DEFAULT_CONFIG.network,
+        coin: params.get("coin") || persisted.coin || DEFAULT_CONFIG.coin,
+        seller_keys: params.get("seller_keys") || persisted.seller_keys || DEFAULT_CONFIG.seller_keys
+    };
+    var buyerPrivkeyParam = params.get("buyer_privkey");
+    var buyerPrivkeyFromUrl = decodedSet ? isUrlSafeBuyerPrivkeySentinel(decodedSet.buyer_privkey) ? decodedSet.buyer_privkey : null : isUrlSafeBuyerPrivkeySentinel(buyerPrivkeyParam) ? buyerPrivkeyParam : null;
+    if (!decodedSet && buyerPrivkeyParam && !buyerPrivkeyFromUrl) console.error('ignoring ?buyer_privkey= -- only "random" or "NIP-07_Extension" may be set via a URL (a real key or bunker string must never appear in a URL); got:', JSON.stringify(buyerPrivkeyParam));
+    config.buyer_privkey = buyerPrivkeyFromUrl || sessionStorage.buyer_privkey_session || loadPersistedBuyerPrivkey() || (isNip07Available() ? "NIP-07_Extension" : "") || DEFAULT_CONFIG.buyer_privkey;
+    config._fromObfuscatedUrl = !!decodedSet;
+    return config;
+}
+
+function describeBuyerPrivkeyPreset(value) {
+    if (value === "random") return '"random"';
+    if (value === "NIP-07_Extension") return '"NIP-07_Extension"';
+    if (/^bunker:\/\//i.test(value)) return "a bunker connect string";
+    return "a valid privkey";
+}
+
+async function getBuyerConfig() {
+    var config = resolveCurrentBuyerConfig();
+    var fromObfuscatedUrl = config._fromObfuscatedUrl;
+    persistBuyerSettings({
+        relay: config.relay,
+        network: config.network,
+        coin: config.coin,
+        seller_keys: config.seller_keys
+    });
+    config.relay, config.network, config.coin, config.seller_keys;
+    if (config.buyer_privkey) describeBuyerPrivkeyPreset(config.buyer_privkey); else {
+        config = await showConfigDialog(config);
+        config._fromObfuscatedUrl = fromObfuscatedUrl;
+    }
+    sessionStorage.buyer_privkey_session = config.buyer_privkey;
+    if (!config._fromObfuscatedUrl) {
+        var buyerPrivkeySentinelForSet = isUrlSafeBuyerPrivkeySentinel(config.buyer_privkey) ? config.buyer_privkey : "";
+        var equivalentSetUrl = window.location.origin + window.location.pathname + "?set=" + encodeSettingsBlob(config.relay, config.network, config.coin, config.seller_keys, buyerPrivkeySentinelForSet);
+    }
+    return config;
+}
+
+document.querySelector(".settings-btn").onclick = async function() {
+    var current = resolveCurrentBuyerConfig();
+    var result = await showConfigDialog(current);
+    sessionStorage.buyer_privkey_session = result.buyer_privkey;
+    persistBuyerSettings({
+        relay: result.relay,
+        network: result.network,
+        coin: result.coin,
+        seller_keys: result.seller_keys
+    });
+    location.reload();
+};
+
+async function startSwapService(config) {
+    var network = evrmorejs.networks[config.network === "testnet" ? "evrmoreTestnet" : "evrmore"];
+    var evrRpcPrefix = config.network === "testnet" ? "testnet" : "mainnet";
+    var evrRpcBase = "https://evr-rpc-" + evrRpcPrefix + ".evrmorecoin.org";
+    var offerKind = config.network === "testnet" ? 10042 : 10043;
+    var dmKind = config.network === "testnet" ? 4044 : 4045;
+    var BUYER_PROTOCOL_VERSION = 3;
+    var statusKind = config.network === "testnet" ? 30042 : 30043;
+    var priceSuggestionKind = config.network === "testnet" ? 10044 : 10045;
+    function clearDealSessionState() {
+        [ "htlcInfo", "waiting_for_payment", "alert_sent", "successful_payment", "offerId", "expected_invoice_amount" ].forEach(function(key) {
+            sessionStorage.removeItem(key);
+        });
+    }
+    var hadInProgressDeal = !!(sessionStorage.htlcInfo && sessionStorage["waiting_for_payment"]);
+    if (hadInProgressDeal) (async function() {
+        var resume = await customConfirm(`\n            <h2 style="margin-top: 0;">Resume your in-progress swap?</h2>\n            <p>It looks like you had a swap in progress before this page reloaded, closed, or crashed. If you haven't received your purchase yet, you can resume waiting for it now instead of starting over.</p>\n            <p>Click <strong>OK</strong> to resume waiting for your on-chain deposit and sweep it automatically once it arrives. Click <strong>Cancel</strong> to abandon it and start over instead -- only do that if you're sure the deal already failed or you no longer want it; resuming costs nothing to try first.</p>\n          `);
+        if (resume) await waitForDepositAndSweep(); else clearDealSessionState();
+    })(); else clearDealSessionState();
+    window.addEventListener("beforeunload", function(e) {
+        if (sessionStorage["waiting_for_payment"]) {
+            e.preventDefault();
+            e.returnValue = "";
+        }
+    });
+    function modalVanish() {
+        $(".black-bg").style.display = "none";
+        $(".modal").style.display = "none";
+    }
+    function cancelSwapAttempt() {
+        modalVanish();
+        sessionStorage["alert_sent"] = true;
+        sessionStorage.removeItem("waiting_for_payment");
+    }
+    function hexToBytes(hex) {
+        return Uint8Array.from(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+    }
+    function hmacSha256(keyBytes, msgBytes) {
+        var blockSize = 64;
+        if (keyBytes.length > blockSize) keyBytes = evrmorejs.crypto.sha256(keyBytes);
+        var keyPadded = new Uint8Array(blockSize);
+        keyPadded.set(keyBytes);
+        var ipad = new Uint8Array(blockSize);
+        var opad = new Uint8Array(blockSize);
+        for (var i = 0; i < blockSize; i++) {
+            ipad[i] = keyPadded[i] ^ 54;
+            opad[i] = keyPadded[i] ^ 92;
+        }
+        var inner = evrmorejs.crypto.sha256(Buffer.concat([ Buffer.from(ipad), Buffer.from(msgBytes) ]));
+        return evrmorejs.crypto.sha256(Buffer.concat([ Buffer.from(opad), Buffer.from(inner) ]));
+    }
+    function isValidAddress(address) {
+        try {
+            var decoded = evrmorejs.address.fromBase58Check(address);
+            return decoded.version === network.pubKeyHash || decoded.version === network.scriptHash;
+        } catch (e) {
+            return;
+        }
+    }
+    function nostrPubkeyToEvrmoreAddress(pubkeyHex) {
+        var compressedPubkey = Buffer.from("02" + pubkeyHex, "hex");
+        return evrmorejs.payments.p2pkh({
+            pubkey: compressedPubkey,
+            network: network
+        }).address;
+    }
+    function encodeNpub(pubkeyHex) {
+        var CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        function polymod(values) {
+            var GEN = [ 996825010, 642813549, 513874426, 1027748829, 705979059 ];
+            var chk = 1;
+            for (var p = 0; p < values.length; p++) {
+                var top = chk >>> 25;
+                chk = (chk & 33554431) << 5 ^ values[p];
+                for (var i = 0; i < 5; i++) if (top >>> i & 1) chk ^= GEN[i];
+            }
+            return chk >>> 0;
+        }
+        function hrpExpand(hrp) {
+            var ret = [];
+            for (var i = 0; i < hrp.length; i++) ret.push(hrp.charCodeAt(i) >> 5);
+            ret.push(0);
+            for (var i2 = 0; i2 < hrp.length; i2++) ret.push(hrp.charCodeAt(i2) & 31);
+            return ret;
+        }
+        var hrp = "npub";
+        var bytes = [];
+        for (var b = 0; b < pubkeyHex.length; b += 2) bytes.push(parseInt(pubkeyHex.substr(b, 2), 16));
+        var acc = 0, bits = 0, words = [];
+        for (var i3 = 0; i3 < bytes.length; i3++) {
+            acc = (acc << 8 | bytes[i3]) >>> 0;
+            bits += 8;
+            while (bits >= 5) {
+                bits -= 5;
+                words.push(acc >>> bits & 31);
+            }
+        }
+        if (bits > 0) words.push(acc << 5 - bits & 31);
+        var checksumValues = hrpExpand(hrp).concat(words).concat([ 0, 0, 0, 0, 0, 0 ]);
+        var mod = polymod(checksumValues) ^ 1;
+        var checksum = [];
+        for (var c = 0; c < 6; c++) checksum.push(mod >>> 5 * (5 - c) & 31);
+        return hrp + "1" + words.concat(checksum).map(function(w) {
+            return CHARSET[w];
+        }).join("");
+    }
+    function asEvrmoreSigner(keyPair) {
+        return {
+            publicKey: Buffer.from(keyPair.publicKey),
+            sign: function(hash) {
+                return Buffer.from(keyPair.sign(hash));
+            }
+        };
+    }
+    var NIP44_VERSION = 2;
+    var NIP44_MIN_PLAINTEXT_LEN = 1;
+    var NIP44_MAX_PLAINTEXT_LEN = 65535;
+    function nip44Utf8ToBytes(str) {
+        return (new TextEncoder).encode(str);
+    }
+    function nip44BytesToUtf8(bytes) {
+        return (new TextDecoder).decode(bytes);
+    }
+    function nip44BytesToBase64(bytes) {
+        var chunkSize = 8192;
+        var binary = "";
+        for (var i = 0; i < bytes.length; i += chunkSize) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        return btoa(binary);
+    }
+    function nip44Base64ToBytes(b64) {
+        var binary = atob(b64);
+        var out = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
+    }
+    function nip44ConcatBytes() {
+        var arrs = Array.prototype.slice.call(arguments);
+        var total = arrs.reduce(function(sum, a) {
+            return sum + a.length;
+        }, 0);
+        var out = new Uint8Array(total);
+        var offset = 0;
+        arrs.forEach(function(a) {
+            out.set(a, offset);
+            offset += a.length;
+        });
+        return out;
+    }
+    function nip44GetConversationKey(privkeyHex, pubkeyHex) {
+        var sharedX = hexToBytes(nobleSecp256k1.getSharedSecret(privkeyHex, "02" + pubkeyHex, true).substring(2));
+        return nobleNip44.hkdfExtract(nobleNip44.sha256, sharedX, nip44Utf8ToBytes("nip44-v2"));
+    }
+    function nip44GetMessageKeys(conversationKey, nonce) {
+        var expanded = nobleNip44.hkdfExpand(nobleNip44.sha256, conversationKey, nonce, 76);
+        return {
+            chachaKey: expanded.slice(0, 32),
+            chachaNonce: expanded.slice(32, 44),
+            hmacKey: expanded.slice(44, 76)
+        };
+    }
+    function nip44CalcPaddedLen(unpaddedLen) {
+        if (unpaddedLen <= 32) return 32;
+        var nextPower = Math.pow(2, Math.floor(Math.log2(unpaddedLen - 1)) + 1);
+        var chunk = nextPower <= 256 ? 32 : nextPower / 8;
+        return chunk * (Math.floor((unpaddedLen - 1) / chunk) + 1);
+    }
+    function nip44Pad(plaintextBytes) {
+        var len = plaintextBytes.length;
+        if (len < NIP44_MIN_PLAINTEXT_LEN || len > NIP44_MAX_PLAINTEXT_LEN) throw new Error("nip44: plaintext length " + len + " is outside the allowed range [1, 65535]");
+        var prefix = new Uint8Array(2);
+        prefix[0] = len >> 8 & 255;
+        prefix[1] = len & 255;
+        var paddedLen = nip44CalcPaddedLen(len);
+        return nip44ConcatBytes(prefix, plaintextBytes, new Uint8Array(paddedLen - len));
+    }
+    function nip44Unpad(paddedBytes) {
+        if (paddedBytes.length < 2) throw new Error("nip44: padded plaintext too short");
+        var len = paddedBytes[0] << 8 | paddedBytes[1];
+        var plaintextBytes = paddedBytes.slice(2, 2 + len);
+        if (len < NIP44_MIN_PLAINTEXT_LEN || len > NIP44_MAX_PLAINTEXT_LEN || plaintextBytes.length !== len || paddedBytes.length !== 2 + nip44CalcPaddedLen(len)) throw new Error("nip44: invalid padding");
+        return plaintextBytes;
+    }
+    function encrypt(privkey, pubkey, text) {
+        var conversationKey = nip44GetConversationKey(privkey, pubkey);
+        var nonce = window.crypto.getRandomValues(new Uint8Array(32));
+        var keys = nip44GetMessageKeys(conversationKey, nonce);
+        var padded = nip44Pad(nip44Utf8ToBytes(text));
+        var ciphertext = nobleNip44.chacha20(keys.chachaKey, keys.chachaNonce, padded, void 0, 0);
+        var mac = nobleNip44.hmac(nobleNip44.sha256, keys.hmacKey, nip44ConcatBytes(nonce, ciphertext));
+        return nip44BytesToBase64(nip44ConcatBytes(Uint8Array.of(NIP44_VERSION), nonce, ciphertext, mac));
+    }
+    function decrypt(privkey, pubkey, ciphertext) {
+        try {
+            if (typeof ciphertext !== "string" || ciphertext.length === 0 || ciphertext[0] === "#") throw new Error("nip44: unknown encryption version");
+            var decoded = nip44Base64ToBytes(ciphertext);
+            if (decoded[0] !== NIP44_VERSION) throw new Error("nip44: unknown encryption version " + decoded[0]);
+            if (decoded.length < 1 + 32 + 32) throw new Error("nip44: payload too short");
+            var nonce = decoded.slice(1, 33);
+            var mac = decoded.slice(decoded.length - 32);
+            var ciphertextBytes = decoded.slice(33, decoded.length - 32);
+            var conversationKey = nip44GetConversationKey(privkey, pubkey);
+            var keys = nip44GetMessageKeys(conversationKey, nonce);
+            var expectedMac = nobleNip44.hmac(nobleNip44.sha256, keys.hmacKey, nip44ConcatBytes(nonce, ciphertextBytes));
+            if (!nobleNip44.equalBytes(mac, expectedMac)) throw new Error("nip44: invalid MAC");
+            var padded = nobleNip44.chacha20(keys.chachaKey, keys.chachaNonce, ciphertextBytes, void 0, 0);
+            return nip44BytesToUtf8(nip44Unpad(padded));
+        } catch (e) {
+            return "error decrypting message -- the message was malformed";
+        }
+    }
+    var seen_ids = [];
+    var $ = document.querySelector.bind(document);
+    var $$ = document.querySelectorAll.bind(document);
+    $(".black-bg").onclick = cancelSwapAttempt;
+    var {getSharedSecret: getSharedSecret, schnorr: schnorr, utils: utils} = nobleSecp256k1;
+    var crypto = window.crypto;
+    var getRand = size => crypto.getRandomValues(new Uint8Array(size));
+    var sha256 = evrmorejs.crypto.sha256;
+    var NIP46_KIND = 24133;
+    var buyerSignerMode = config.buyer_privkey === "NIP-07_Extension" ? "nip07" : /^bunker:\/\//i.test(config.buyer_privkey || "") ? "nip46" : "raw";
+    var privKey = buyerSignerMode === "raw" ? resolveBuyerPrivkey(config.buyer_privkey) : null;
+    var remoteSignerPubkey = null;
+    var nip46ClientKey = null;
+    var nip46ClientPubkey = null;
+    var bunkerRelayConnections = [];
+    var pendingBunkerResponses = {};
+    var pubKey = buyerSignerMode === "raw" ? Buffer.from(evrmorejs.ECPair.fromPrivateKey(Buffer.from(privKey, "hex")).publicKey).toString("hex").substring(2) : buyerSignerMode === "nip07" ? await resolveNip07Pubkey() : await resolveNip46Pubkey(config.buyer_privkey);
+    var buyerSuggestedAddress = null;
+    var buyerNpub = null;
+    if (config.buyer_privkey !== "random") try {
+        buyerSuggestedAddress = nostrPubkeyToEvrmoreAddress(pubKey);
+        buyerNpub = encodeNpub(pubKey);
+    } catch (e) {
+        console.error("couldn't derive an Evrmore address from this session's Nostr pubkey:", e.message);
+    }
+    var htlcMasterKey = getOrCreateHtlcMasterKey();
+    document.querySelector(".settings-btn").onclick = async function() {
+        var current = resolveCurrentBuyerConfig();
+        current.buyer_privkey = config.buyer_privkey;
+        var result = await showConfigDialog(current);
+        sessionStorage.buyer_privkey_session = result.buyer_privkey;
+        if (nip46ClientKey) sessionStorage.nip46_client_key_session = nip46ClientKey;
+        persistBuyerSettings({
+            relay: result.relay,
+            network: result.network,
+            coin: result.coin,
+            seller_keys: result.seller_keys
+        });
+        location.reload();
+    };
+    async function resolveNip07Pubkey() {
+        if (!window.nostr || typeof window.nostr.getPublicKey !== "function") throw new Error('buyer_privkey is set to "NIP-07_Extension" but no compatible browser extension (window.nostr) was found. Install one (e.g. nos2x, Alby) and reload.');
+        var pk = await window.nostr.getPublicKey();
+        return pk.length === 66 ? pk.slice(2) : pk;
+    }
+    function wireBunkerSocket(conn) {
+        conn.socket.addEventListener("message", function(message) {
+            handleBunkerMessage(message, conn);
+        });
+        conn.socket.addEventListener("open", function() {
+            conn.url;
+            var subscription = [ "REQ", conn.subId, {
+                kinds: [ NIP46_KIND ],
+                "#p": [ nip46ClientPubkey ]
+            } ];
+            try {
+                conn.socket.send(JSON.stringify(subscription));
+            } catch (e) {
+                conn.url, e.message;
+            }
+        });
+    }
+    function connectBunkerRelay(url) {
+        var conn = {
+            url: url,
+            subId: Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex"),
+            socket: new WebSocket(url)
+        };
+        wireBunkerSocket(conn);
+        return conn;
+    }
+    function reconnectBunkerRelay(conn) {
+        conn.socket = new WebSocket(conn.url);
+        wireBunkerSocket(conn);
+    }
+    function broadcastToBunkerRelays(raw) {
+        var succeededOnAny = false;
+        bunkerRelayConnections.forEach(function(conn) {
+            if (conn.socket.readyState !== 1) return;
+            try {
+                conn.socket.send(raw);
+                succeededOnAny = true;
+            } catch (e) {
+                conn.url, e.message;
+            }
+        });
+        return succeededOnAny;
+    }
+    function waitForAnyBunkerRelayOpen(timeoutMs) {
+        var elapsedMs = 0;
+        return new Promise(function(resolve, reject) {
+            (function poll() {
+                if (bunkerRelayConnections.some(function(conn) {
+                    return conn.socket.readyState === 1;
+                })) resolve(); else if (elapsedMs >= timeoutMs) reject(new Error("could not connect to any NIP-46 bunker relay")); else setTimeout(function() {
+                    elapsedMs += 100;
+                    poll();
+                }, 100);
+            })();
+        });
+    }
+    async function handleBunkerMessage(message, conn) {
+        var parsed;
+        try {
+            parsed = JSON.parse(message.data);
+        } catch (e) {
+            return;
+        }
+        var [type, subId, event] = parsed;
+        if (type !== "EVENT" || !event || !event.id) return;
+        if (event.kind !== NIP46_KIND) return;
+        if (event.pubkey !== remoteSignerPubkey) return;
+        if (!await verifyEvent(event)) return;
+        var decrypted = decrypt(nip46ClientKey, event.pubkey, event.content);
+        if (!isValidJson(decrypted)) return;
+        var response = JSON.parse(decrypted);
+        if (!response.id) return;
+        var entry = pendingBunkerResponses[response.id];
+        if (entry) {
+            entry.response = response;
+            entry.settled = true;
+        }
+    }
+    function waitForBunkerResponse(id, timeoutMs) {
+        var elapsedMs = 0;
+        return new Promise(function(resolve) {
+            (function poll() {
+                var entry = pendingBunkerResponses[id];
+                if (entry && entry.settled) resolve(entry.response); else if (elapsedMs >= timeoutMs) resolve(null); else setTimeout(function() {
+                    elapsedMs += 100;
+                    poll();
+                }, 100);
+            })();
+        });
+    }
+    async function callBunker(method, params) {
+        var id = Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+        var content = encrypt(nip46ClientKey, remoteSignerPubkey, JSON.stringify({
+            id: id,
+            method: method,
+            params: params
+        }));
+        var event = {
+            pubkey: nip46ClientPubkey,
+            created_at: Math.floor(Date.now() / 1e3),
+            kind: NIP46_KIND,
+            tags: [ [ "p", remoteSignerPubkey ] ],
+            content: content
+        };
+        var signed = await getSignedEvent(event, nip46ClientKey);
+        var maxAttempts = 3;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+            pendingBunkerResponses[id] = {
+                response: null,
+                settled: false
+            };
+            broadcastToBunkerRelays(JSON.stringify([ "EVENT", signed ]));
+            var response = await waitForBunkerResponse(id, 2e4);
+            while (response && response.error && response.result === "auth_url") {
+                response.error;
+                pendingBunkerResponses[id] = {
+                    response: null,
+                    settled: false
+                };
+                response = await waitForBunkerResponse(id, 12e4);
+            }
+            delete pendingBunkerResponses[id];
+            if (response) {
+                if (response.error) throw new Error("NIP-46 bunker error (" + method + "): " + response.error);
+                return response.result;
+            }
+        }
+        throw new Error("no response from NIP-46 bunker for method " + method + " after " + maxAttempts + " attempts");
+    }
+    async function resolveNip46Pubkey(connectString) {
+        var parsed = parseBunkerConnectString(connectString);
+        if (!parsed) throw new Error("buyer_privkey looks like a bunker connect string but couldn't be parsed (expected bunker://<pubkey>?relay=<url>[&relay=<url2>][&secret=<secret>]).");
+        remoteSignerPubkey = parsed.remoteSignerPubkey;
+        nip46ClientKey = sessionStorage.nip46_client_key_session || loadPersistedNip46ClientKey() || Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+        sessionStorage.nip46_client_key_session = nip46ClientKey;
+        nip46ClientPubkey = Buffer.from(evrmorejs.ECPair.fromPrivateKey(Buffer.from(nip46ClientKey, "hex")).publicKey).toString("hex").substring(2);
+        bunkerRelayConnections = parsed.relays.map(connectBunkerRelay);
+        await waitForAnyBunkerRelayOpen(1e4);
+        parsed.relays;
+        await callBunker("connect", parsed.secret ? [ remoteSignerPubkey, parsed.secret ] : [ remoteSignerPubkey ]);
+        var identityPubkey = await callBunker("get_public_key", []);
+        return identityPubkey.length === 66 ? identityPubkey.slice(2) : identityPubkey;
+    }
+    async function signEventWithSigner(event) {
+        if (buyerSignerMode === "nip07") return await window.nostr.signEvent(event);
+        if (buyerSignerMode === "nip46") {
+            var unsigned = {
+                kind: event.kind,
+                content: event.content,
+                tags: event.tags,
+                created_at: event.created_at
+            };
+            var signedJson = await callBunker("sign_event", [ JSON.stringify(unsigned) ]);
+            return JSON.parse(signedJson);
+        }
+        return await getSignedEvent(event, privKey);
+    }
+    async function encryptWithSigner(counterpartyPubkey, plaintext) {
+        if (buyerSignerMode === "nip07") {
+            if (!window.nostr.nip44 || typeof window.nostr.nip44.encrypt !== "function") throw new Error("This browser extension doesn't support NIP-44 encryption (window.nostr.nip44.encrypt is missing) -- a NIP-04-only extension can't be used here.");
+            return await window.nostr.nip44.encrypt(counterpartyPubkey, plaintext);
+        }
+        if (buyerSignerMode === "nip46") return await callBunker("nip44_encrypt", [ counterpartyPubkey, plaintext ]);
+        return encrypt(privKey, counterpartyPubkey, plaintext);
+    }
+    async function decryptWithSigner(counterpartyPubkey, ciphertext) {
+        if (buyerSignerMode === "nip07") {
+            if (!window.nostr.nip44 || typeof window.nostr.nip44.decrypt !== "function") throw new Error("This browser extension doesn't support NIP-44 decryption (window.nostr.nip44.decrypt is missing).");
+            try {
+                return await window.nostr.nip44.decrypt(counterpartyPubkey, ciphertext);
+            } catch (e) {
+                return "error decrypting message -- the message was malformed";
+            }
+        }
+        if (buyerSignerMode === "nip46") try {
+            return await callBunker("nip44_decrypt", [ counterpartyPubkey, ciphertext ]);
+        } catch (e) {
+            return "error decrypting message -- the message was malformed";
+        }
+        return decrypt(privKey, counterpartyPubkey, ciphertext);
+    }
+    var relays = parseRelayList(config.relay);
+    var relayConnections = relays.map(connectRelay);
+    async function waitForDepositAndSweep() {
+        var htlcArray = JSON.parse(sessionStorage.htlcInfo);
+        var waitIsOver = await waitForMoneyToArriveInAddress(htlcArray[0]);
+        sessionStorage.removeItem("alert_sent");
+        if (waitIsOver == "failure") return;
+        var isAssetDeal = typeof htlcArray[9] !== "undefined";
+        var txid, txindex, amount_received, assetLeg;
+        if (isAssetDeal) {
+            var swapUtxos = null;
+            while (!swapUtxos) {
+                swapUtxos = await addressReceivedAssetSwapUtxos(htlcArray[0], htlcArray[9]);
+                if (!swapUtxos) await new Promise(function(resolve) {
+                    setTimeout(resolve, 5e3);
+                });
+            }
+            txid = swapUtxos.evrLeg.txid;
+            txindex = swapUtxos.evrLeg.vout;
+            assetLeg = swapUtxos.assetLeg;
+            amount_received = swapUtxos.evrLeg.amt;
+            var asset_amount_received = swapUtxos.assetLeg.amt;
+            if (amount_received !== htlcArray[2] || asset_amount_received !== htlcArray[10]) {
+                alert("Seller tried to scam you, aborting trade! EVR-leg received: " + amount_received + " expected: " + htlcArray[2] + " -- asset-leg received: " + asset_amount_received + " expected: " + htlcArray[10]);
+                sessionStorage["alert_sent"] = true;
+                sessionStorage.removeItem("waiting_for_payment");
+                return;
+            }
+        } else {
+            var tx_array = await addressReceivedMoneyInThisTx(htlcArray[0]);
+            txid = tx_array[0];
+            txindex = tx_array[1];
+            amount_received = tx_array[2];
+            var amount_expected = htlcArray[2];
+            if (amount_received !== amount_expected) {
+                alert("Seller tried to scam you, aborting trade! Amount received: " + amount_received + " Amount expected: " + amount_expected, " Equality: " + amount_received === amount_expected);
+                sessionStorage["alert_sent"] = true;
+                sessionStorage.removeItem("waiting_for_payment");
+                return;
+            }
+        }
+        var original_quantity_of_sats = htlcArray[2];
+        var userPrivkey = htlcArray[4];
+        var serverPubkey = htlcArray[1];
+        var useraddress = htlcArray[6];
+        var priorTxids = await getAddressTxids(useraddress);
+        async function buildSweepTx(feeMultiplier) {
+            var freshFeerate = await getMinFeeRate();
+            var fee = Math.ceil(350 * freshFeerate * feeMultiplier);
+            var new_quantity_of_sats = original_quantity_of_sats - fee;
+            var tx_hex = await sweepingHTLC(txid, txindex, original_quantity_of_sats, new_quantity_of_sats, userPrivkey, serverPubkey, htlcArray[3], htlcArray[5], useraddress, htlcArray[7], isAssetDeal ? {
+                txid: assetLeg.txid,
+                vout: assetLeg.vout
+            } : void 0, isAssetDeal ? htlcArray[9] : void 0, isAssetDeal ? htlcArray[10] : void 0);
+            return {
+                tx_hex: tx_hex,
+                fee: fee,
+                new_quantity_of_sats: new_quantity_of_sats
+            };
+        }
+        modalVanish();
+        showInfoModal(`\n          <h2 style="margin-top: 0;">You're almost done!</h2>\n          <p>The seller has put your purchase into an HTLC contract locked with your secret.</p>\n          <p>The contract is at address:<br>\n            <span style="font-family: monospace; word-break: break-all;">${htlcArray[0]}</span>\n          </p>\n          <p>created by transaction:<br>\n            <a href="https://evr-rpc-${evrRpcPrefix}.evrmorecoin.org/explorer/#/tx/${txid}" target="_blank" style="font-family: monospace; word-break: break-all;">${txid}</a>\n          </p>\n          <p>After it confirms on the Evrmore blockchain, your secret will be automatically used to open the contract and sweep your purchase into the final address you chose earlier:<br>\n            <span style="font-family: monospace; word-break: break-all;">${useraddress}</span></p>\n          <p>That sweep operation reveals your secret on the blockchain, which the seller will use to collect the Lightning invoice payment you made.</p>\n          <p>This window will close automatically once the sweep transaction confirms on the blockchain.</p>\n          <p>Please wait about 1 minute...</p>\n        `);
+        var broadcastOk = await attemptSweepBroadcast(buildSweepTx);
+        if (!broadcastOk) {
+            sessionStorage["alert_sent"] = true;
+            sessionStorage.removeItem("waiting_for_payment");
+            return;
+        }
+        var sweep_txid = broadcastOk.sweep_txid;
+        var new_quantity_of_sats = broadcastOk.new_quantity_of_sats;
+        sessionStorage["successful_payment"] = true;
+        sessionStorage.removeItem("waiting_for_payment");
+        var confirmedTxid = await waitForNewPaymentToAddress(useraddress, priorTxids, new_quantity_of_sats);
+        if (!confirmedTxid) {
+            modalVanish();
+            alert("Your sweep transaction broadcast, but no matching payment showed up at your destination address (" + useraddress + ") after 10 minutes. Your funds may still arrive -- check the explorer or your wallet before trying again.");
+            window.location.reload();
+            return;
+        }
+        var sweepConfirmed = await waitForOneConfirmation(confirmedTxid);
+        modalVanish();
+        if (!sweepConfirmed) {
+            alert("Your sweep transaction (" + confirmedTxid + ") hasn't confirmed yet after a while. It may still confirm later -- check the explorer link, or the address you chose, before trying again.");
+            window.location.reload();
+            return;
+        }
+        await customAlert(`\n          <h2 style="margin-top: 0;">Your transaction was a success!</h2>\n          <p>Here is the transaction which gave you your purchase:<br>\n            <a href="https://evr-rpc-${evrRpcPrefix}.evrmorecoin.org/explorer/#/tx/${confirmedTxid}" target="_blank" style="font-family: monospace; word-break: break-all;">${confirmedTxid}</a>\n          </p>\n          ${isAssetDeal ? `<p>Your purchase of ${htlcArray[10] / 1e8} ${htlcArray[9]} (plus ~${(new_quantity_of_sats / 1e8).toLocaleString(void 0, {
+            maximumFractionDigits: 8
+        })} EVR) was transferred on the Evrmore blockchain into the address you specified:<br>\n            <span style="font-family: monospace; word-break: break-all;">${useraddress}</span>\n          </p>` : `<p>Your purchase of ${(new_quantity_of_sats / 1e8).toLocaleString(void 0, {
+            maximumFractionDigits: 8
+        })} EVR was transferred on the Evrmore blockchain into the address you specified:<br>\n            <span style="font-family: monospace; word-break: break-all;">${useraddress}</span>\n          </p>`}\n        `);
+        window.location.reload();
+    }
+    async function attemptSweepBroadcast(buildTx) {
+        var feeMultiplier = 1;
+        while (true) {
+            var built = await buildTx(feeMultiplier);
+            try {
+                var sweep_txid = await pushBTCpmt(built.tx_hex);
+                return {
+                    sweep_txid: sweep_txid,
+                    new_quantity_of_sats: built.new_quantity_of_sats
+                };
+            } catch (e) {
+                var nextFeeMultiplier = feeMultiplier * 1.5;
+                var retry = await new Promise(function(resolve) {
+                    showModal(`\n                <h2 style="margin-top: 0;">Broadcast failed</h2>\n                <p>${e.message}</p>\n                <p>Your funds are still safely in the HTLC contract -- nothing was lost. This can happen if network fees rose since you accepted the offer. Retrying will rebuild the transaction with a fee about 50% higher than this attempt's ${built.fee} sats (reducing your payout slightly) -- or you can cancel and try again later.</p>\n                <div style="display: flex; gap: 1rem; justify-content: center; margin-top: 1rem;">\n                  <button class="sweep-retry-cancel-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: white; color: black;">Cancel</button>\n                  <button class="sweep-retry-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">Retry with a higher fee</button>\n                </div>\n              `);
+                    $(".sweep-retry-btn").onclick = function() {
+                        resolve(true);
+                    };
+                    $(".sweep-retry-cancel-btn").onclick = function() {
+                        resolve(false);
+                    };
+                });
+                if (!retry) {
+                    modalVanish();
+                    return null;
+                }
+                feeMultiplier = nextFeeMultiplier;
+            }
+        }
+    }
+    async function handleMessage(message, conn) {
+        var [type, subId, event] = JSON.parse(message.data);
+        conn.url, message.data;
+        var {kind: kind, content: content} = event || {};
+        if (!event || !event["id"]) return;
+        if (!await verifyEvent(event)) {
+            event.id;
+            return;
+        }
+        if (seen_ids.includes(event.id)) return;
+        seen_ids.push(event.id);
+        if (kind === statusKind) {
+            if (!isValidJson(content)) return;
+            var parsedStatus = JSON.parse(content);
+            if (!parsedStatus || !parsedStatus.status) return;
+            var statusOfferId = getTag(event, "d");
+            if (!statusOfferId) return;
+            if (parsedStatus.status === "offer_taken") {
+                var offerRowToRemove = $(`tr[data-offer_id="${statusOfferId}"]`);
+                if (offerRowToRemove) offerRowToRemove.remove();
+                return;
+            }
+            if (parsedStatus.status === "buyer_invoice_paid") {
+                if (statusOfferId !== sessionStorage.offerId) return;
+                modalVanish();
+                showInfoModal("<p>Invoice payment received. The HTLC contract transaction is now being funded.</p><p>Please wait about 1 minute...</p>");
+                return;
+            }
+            return;
+        }
+        if (kind === offerKind) {
+            if (!isValidJson(content)) return;
+            var parsedEvent = JSON.parse(content);
+            var isAssetOffer = typeof parsedEvent.asset_name !== "undefined";
+            if (!offerMatchesCoinFilter(config.coin, isAssetOffer, parsedEvent.asset_name)) return;
+            if (!offerMatchesSellerFilter(config.seller_keys, parsedEvent.seller_pubkey)) return;
+            if (isAssetOffer) {
+                if (Object.keys(parsedEvent).length !== 13) return;
+                if (!parsedEvent.offer_id || !parsedEvent.pubkey || !parsedEvent.seller_pubkey || !parsedEvent.asset_name || !parsedEvent.asset_min_amount || !parsedEvent.asset_max_amount || !parsedEvent.fee_type || !parsedEvent.fee || !parsedEvent.rate_asset_per_btc || !parsedEvent.evr_bundle_amount || !parsedEvent.rate_evr_per_btc || !parsedEvent.network || !parsedEvent.buyer_protocol_version) return;
+                if (parsedEvent.network !== config.network) return;
+                if (parsedEvent.buyer_protocol_version !== BUYER_PROTOCOL_VERSION) return;
+                if (!isHex(parsedEvent.offer_id)) return;
+                if (parsedEvent.offer_id.length !== 64) return;
+                if (!isHex(parsedEvent.pubkey)) return;
+                if (parsedEvent.pubkey.length !== 66) return;
+                if (!isHex(parsedEvent.seller_pubkey)) return;
+                if (parsedEvent.seller_pubkey.length !== 64) return;
+                if (!isValidAssetName(parsedEvent.asset_name)) return;
+                if (typeof parsedEvent.asset_min_amount !== "number") return;
+                if (typeof parsedEvent.asset_max_amount !== "number") return;
+                if (parsedEvent.asset_min_amount < 1 || parsedEvent.asset_min_amount > 21e9) return;
+                if (parsedEvent.asset_max_amount < 1 || parsedEvent.asset_max_amount > 21e9) return;
+                if (parsedEvent.asset_max_amount < parsedEvent.asset_min_amount) return;
+                if (typeof parsedEvent.fee_type !== "string") return;
+                if (parsedEvent.fee_type !== "absolute" && parsedEvent.fee_type !== "percentage") return;
+                if (typeof parsedEvent.fee !== "number") return;
+                if (parsedEvent.fee < 0) return;
+                if (typeof parsedEvent.rate_asset_per_btc !== "number") return;
+                if (parsedEvent.rate_asset_per_btc <= 0) return;
+                if (typeof parsedEvent.evr_bundle_amount !== "number") return;
+                if (parsedEvent.evr_bundle_amount < 3e-5) return;
+                if (typeof parsedEvent.rate_evr_per_btc !== "number") return;
+                if (parsedEvent.rate_evr_per_btc <= 0) return;
+            } else {
+                if (Object.keys(parsedEvent).length !== 10) return;
+                if (!parsedEvent.offer_id || !parsedEvent.pubkey || !parsedEvent.seller_pubkey || !parsedEvent.min_amount || !parsedEvent.max_amount || !parsedEvent.fee_type || !parsedEvent.fee || !parsedEvent.rate_evr_per_btc || !parsedEvent.network || !parsedEvent.buyer_protocol_version) return;
+                if (parsedEvent.network !== config.network) return;
+                if (parsedEvent.buyer_protocol_version !== BUYER_PROTOCOL_VERSION) return;
+                if (!isHex(parsedEvent.offer_id)) return;
+                if (parsedEvent.offer_id.length !== 64) return;
+                if (!isHex(parsedEvent.pubkey)) return;
+                if (parsedEvent.pubkey.length !== 66) return;
+                if (!isHex(parsedEvent.seller_pubkey)) return;
+                if (parsedEvent.seller_pubkey.length !== 64) return;
+                if (typeof parsedEvent.min_amount !== "number") return;
+                if (typeof parsedEvent.max_amount !== "number") return;
+                if (parsedEvent.min_amount < 3e-5) return;
+                if (parsedEvent.max_amount < 3e-5) return;
+                if (typeof parsedEvent.fee_type !== "string") return;
+                if (parsedEvent.fee_type !== "absolute" && parsedEvent.fee_type !== "percentage") return;
+                if (typeof parsedEvent.fee !== "number") return;
+                if (parsedEvent.fee < 0) return;
+                if (typeof parsedEvent.rate_evr_per_btc !== "number") return;
+                if (parsedEvent.rate_evr_per_btc <= 0) return;
+            }
+            content = JSON.parse(content);
+            var row = document.createElement("tr");
+            row.setAttribute("data-pubkey", event.pubkey);
+            row.setAttribute("data-offer_id", content.offer_id);
+            row.setAttribute("data-last-seen", event.created_at * 1e3);
+            row.innerHTML = `\n                <td>${isAssetOffer ? content.asset_name : "EVR"}</td>\n                <td class="rate"></td>\n                <td class="min_amt"></td>\n                <td class="max_amt"></td>\n                <td style="font-family: monospace; word-break: break-all; font-size: 0.8rem;">${event.pubkey}</td>\n                <td style="font-family: monospace; word-break: break-all; font-size: 0.8rem;">${content.seller_pubkey}</td>\n                <td>Untaken</td>\n                <td class="created"></td>\n              `;
+            if (isAssetOffer) {
+                row.getElementsByClassName("min_amt")[0].innerText = content.asset_min_amount.toLocaleString(void 0, {
+                    maximumFractionDigits: 8
+                });
+                row.getElementsByClassName("max_amt")[0].innerText = content.asset_max_amount.toLocaleString(void 0, {
+                    maximumFractionDigits: 8
+                });
+                row.getElementsByClassName("rate")[0].innerText = "1 BTC = " + content.rate_asset_per_btc.toLocaleString(void 0, {
+                    maximumFractionDigits: 8
+                }) + " " + content.asset_name;
+            } else {
+                row.getElementsByClassName("min_amt")[0].innerText = content.min_amount.toLocaleString(void 0, {
+                    maximumFractionDigits: 8
+                });
+                row.getElementsByClassName("max_amt")[0].innerText = content.max_amount.toLocaleString(void 0, {
+                    maximumFractionDigits: 8
+                });
+                row.getElementsByClassName("rate")[0].innerText = "1 BTC = " + content.rate_evr_per_btc.toLocaleString(void 0, {
+                    maximumFractionDigits: 8
+                }) + " EVR";
+            }
+            row.getElementsByClassName("created")[0].innerText = new Date(event.created_at * 1e3).toISOString();
+            row.onclick = function() {
+                if (sessionStorage["waiting_for_payment"]) {
+                    alert("You already have a swap in progress. Finish or cancel it before accepting another offer.");
+                    return;
+                }
+                openAcceptOfferModal(event.pubkey, content);
+            };
+            function openAcceptOfferModal(sellerPubkey, content) {
+                var isAssetDeal = typeof content.asset_name !== "undefined";
+                $(".modal").style.maxWidth = "500px";
+                $(".modal").style.textAlign = "left";
+                $(".modal").innerHTML = `\n              <h2 style="margin-top: 0;">Accept offer</h2>\n              <p>Enter an amount of ${isAssetDeal ? content.asset_name : "EVR"} you want to receive</p>\n              <p><input type="number" step="0.00000001" class="enter_amount"></p>\n              <p>Enter an Evrmore address where you want to receive your purchased assets and/or EVR</p>\n              <p><input class="enter_address"></p>\n              <p class="nostr-address-note" style="font-size: 0.8rem; color: #555; margin-top: -0.75rem; display: none;"></p>\n              <div style="display: flex; gap: 1rem; justify-content: center; margin-top: 1rem;">\n                <button class="modal-cancel-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: white; color: black;">Cancel</button>\n                <button class="finalize_acceptance" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">Submit</button>\n              </div>\n            `;
+                $(".enter_amount").value = isAssetDeal ? content.asset_min_amount : content.min_amount;
+                $(".enter_amount").min = isAssetDeal ? content.asset_min_amount : content.min_amount;
+                $(".enter_amount").max = isAssetDeal ? content.asset_max_amount : content.max_amount;
+                if (buyerSuggestedAddress) {
+                    $(".enter_address").value = buyerSuggestedAddress;
+                    $(".nostr-address-note").textContent = "The Evrmore address shown is the equivalent of your Nostr npub ID (" + buyerNpub + ") and has the same private key";
+                    $(".nostr-address-note").style.display = "block";
+                }
+                $(".black-bg").style.display = "block";
+                $(".modal").style.display = "block";
+                function closeAcceptOfferModal() {
+                    modalVanish();
+                    $(".modal").style.maxWidth = "";
+                    $(".modal").style.textAlign = "";
+                }
+                $(".modal-cancel-btn").onclick = closeAcceptOfferModal;
+                $(".finalize_acceptance").onclick = async function() {
+                    sessionStorage.removeItem("successful_payment");
+                    var btckey = content.pubkey;
+                    var offer_id = content.offer_id;
+                    var amount = $(".enter_amount").value;
+                    if (!amount || isNaN(amount)) {
+                        alert("Please enter a valid amount");
+                        return;
+                    }
+                    amount = Number(amount);
+                    var address = $(".enter_address").value;
+                    var destinationAddress = address;
+                    if (!address || !isValidAddress(address)) {
+                        alert("Please enter a valid Evrmore address (starts with E/e on mainnet, or m/n/2 on testnet)");
+                        return;
+                    }
+                    var jsonAssetAmount, total, mining_fee, service_fee, original_amount;
+                    if (isAssetDeal) {
+                        jsonAssetAmount = amount;
+                        var baseLsats = jsonAssetAmount / content.rate_asset_per_btc * 1e8 + content.evr_bundle_amount / content.rate_evr_per_btc * 1e8;
+                        if (content.fee_type === "absolute") total = baseLsats + content.fee; else total = baseLsats * ((100 + content.fee) / 100);
+                        service_fee = total - baseLsats;
+                        var conf = await customConfirm(`\n                  <h2 style="margin-top: 0;">Confirm payment amount</h2>\n                  <p>The total amount you will pay is <strong>${total.toFixed(0)} L-sats on Bitcoin Lightning</strong>. The breakdown is:</p>\n                  <table style="width: 100%; border-collapse: collapse; margin: 1rem 0;">\n                    <tr>\n                      <td style="padding: 0.5rem; border-bottom: 1px solid #ddd;">${jsonAssetAmount.toLocaleString(void 0, {
+                            maximumFractionDigits: 8
+                        })} ${content.asset_name}</td>\n                      <td style="padding: 0.5rem; border-bottom: 1px solid #ddd; color: #555;">what you will receive on Evrmore</td>\n                    </tr>\n                    <tr>\n                      <td style="padding: 0.5rem; border-bottom: 1px solid #ddd;">~${content.evr_bundle_amount.toLocaleString(void 0, {
+                            maximumFractionDigits: 8
+                        })} EVR</td>\n                      <td style="padding: 0.5rem; border-bottom: 1px solid #ddd; color: #555;">you'll also receive this much EVR, to cover your own sweep transaction's mining fee (any leftover is yours to keep)</td>\n                    </tr>\n                    <tr>\n                      <td style="padding: 0.5rem;">${service_fee.toFixed(0)} L-sats</td>\n                      <td style="padding: 0.5rem; color: #555;">what the swap provider will receive</td>\n                    </tr>\n                  </table>\n                  <p>Click OK if that is alright with you or click Cancel to stop this transaction.</p>\n                `);
+                        if (!conf) return;
+                    } else {
+                        original_amount = amount;
+                        var feerate = await getMinFeeRate();
+                        var mining_fee_evr = 350 * feerate / 1e8;
+                        amount += mining_fee_evr;
+                        total = amount / parsedEvent.rate_evr_per_btc * 1e8;
+                        mining_fee = total - original_amount / parsedEvent.rate_evr_per_btc * 1e8;
+                        if (parsedEvent.fee_type === "absolute") total += parsedEvent.fee; else total = amount / parsedEvent.rate_evr_per_btc * 1e8 * ((100 + parsedEvent.fee) / 100);
+                        service_fee = total - mining_fee - original_amount / parsedEvent.rate_evr_per_btc * 1e8;
+                        var conf = await customConfirm(`\n                <h2 style="margin-top: 0;">Confirm payment amount</h2>\n                <p>The total amount you will pay is <strong>${total.toFixed(0)} L-sats on Bitcoin Lightning</strong>. The breakdown is:</p>\n                <table style="width: 100%; border-collapse: collapse; margin: 1rem 0;">\n                  <tr>\n                    <td style="padding: 0.5rem; border-bottom: 1px solid #ddd;">${original_amount.toFixed(8)} EVR</td>\n                    <td style="padding: 0.5rem; border-bottom: 1px solid #ddd; color: #555;">what you will receive on Evrmore</td>\n                  </tr>\n                  <tr>\n                    <td style="padding: 0.5rem; border-bottom: 1px solid #ddd;">${mining_fee.toFixed(0)} L-sats</td>\n                    <td style="padding: 0.5rem; border-bottom: 1px solid #ddd; color: #555;">estimated Evrmore mining fee</td>\n                  </tr>\n                  <tr>\n                    <td style="padding: 0.5rem;">${service_fee.toFixed(0)} L-sats</td>\n                    <td style="padding: 0.5rem; color: #555;">what the swap provider will receive</td>\n                  </tr>\n                </table>\n                <p>Click OK if that is alright with you or click Cancel to stop this transaction.</p>\n              `);
+                        if (!conf) return;
+                    }
+                    var preimage = Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+                    var revealConf = await customConfirm(`\n                <h2 style="margin-top: 0;">Your secret</h2>\n                <p>I have generated a secret hash for you which nobody knows. The secret is:</p>\n                <p style="font-family: monospace; font-size: 1.05rem; background: #f2f2f2; color: black; padding: 0.75rem; border-radius: 0.5rem; word-break: break-all;">${preimage}</p>\n                <p>You can still cancel this transaction by clicking on the "Cancel" button.</p>\n                <p>If you click "OK", then the seller will generate a Lightning invoice for you to pay. You should pay it within 5 minutes.</p>\n                <p>But don't worry &mdash; the seller won't be able to collect your payment until you reveal the secret to them.</p>\n              `);
+                    if (!revealConf) return;
+                    var hash = Buffer.from(evrmorejs.crypto.sha256(hexToBytes(preimage))).toString("hex");
+                    var derivedHtlcPrv = Buffer.from(hmacSha256(hexToBytes(htlcMasterKey), hexToBytes(offer_id))).toString("hex");
+                    var htlcPair = evrmorejs.ECPair.fromPrivateKey(Buffer.from(derivedHtlcPrv, "hex"));
+                    var htlcPub = Buffer.from(htlcPair.publicKey).toString("hex");
+                    var htlcPrv = Buffer.from(htlcPair.privateKey).toString("hex");
+                    var blockheight = await getBlockheight();
+                    var timelock = blockheight + 100;
+                    var witness_script = generateHtlc(btckey, htlcPub, hash, timelock);
+                    var htlcObject = evrmorejs.payments.p2sh({
+                        redeem: {
+                            output: witness_script,
+                            network: network
+                        },
+                        network: network
+                    });
+                    sessionStorage.htlcInfo = isAssetDeal ? JSON.stringify([ htlcObject.address, btckey, Math.round(content.evr_bundle_amount * 1e8), preimage, htlcPrv, timelock, destinationAddress, htlcPub, Math.round(content.evr_bundle_amount * 1e8), content.asset_name, Math.round(jsonAssetAmount * 1e8) ]) : JSON.stringify([ htlcObject.address, btckey, Math.round(amount * 1e8), preimage, htlcPrv, timelock, destinationAddress, htlcPub, Math.round(original_amount * 1e8) ]);
+                    var message = {};
+                    message["offer_id"] = offer_id;
+                    if (isAssetDeal) message["asset_amount"] = jsonAssetAmount; else message["amount"] = amount;
+                    message["hash"] = hash;
+                    message["script_address"] = htlcObject.address;
+                    message["pubkey"] = htlcPub;
+                    message["timelock"] = timelock;
+                    message["network"] = config.network;
+                    message["buyer_protocol_version"] = BUYER_PROTOCOL_VERSION;
+                    JSON.stringify(message);
+                    var encrypted_message = await encryptWithSigner(sellerPubkey, JSON.stringify(message));
+                    sessionStorage.expected_invoice_amount = Number(total.toFixed(0));
+                    sessionStorage.offerId = offer_id;
+                    var acceptEvent = {
+                        content: encrypted_message,
+                        created_at: Math.floor(Date.now() / 1e3),
+                        kind: dmKind,
+                        tags: [ [ "p", sellerPubkey ] ],
+                        pubkey: pubKey
+                    };
+                    var signedOffer = await signEventWithSigner(acceptEvent);
+                    JSON.stringify([ "EVENT", signedOffer ]);
+                    if (!broadcastToAllRelays(JSON.stringify([ "EVENT", signedOffer ]))) {
+                        alert("Failed to send your acceptance to the seller (connection issue). Please try again.");
+                        return;
+                    }
+                    closeAcceptOfferModal();
+                };
+            }
+            var existing = $(`tr[data-pubkey="${event.pubkey}"]`);
+            if (existing && event.created_at * 1e3 < Number(existing.getAttribute("data-last-seen") || 0)) return;
+            if (existing) existing.remove();
+            $(".orderbook").append(row);
+        }
+        if (kind === dmKind) {
+            try {
+                content = await decryptWithSigner(event.pubkey, content);
+            } catch (e) {
+                var error = `troll data`;
+            }
+            var div = document.createElement("div");
+            div.className = "ln-inv";
+            if (isValidJson(content)) {
+                var parsedContent = JSON.parse(content);
+                if (parsedContent && typeof parsedContent.error === "string") {
+                    alert(parsedContent.error);
+                    return;
+                }
+            }
+            if (!isValidInvoice(content)) {
+                alert("Seller trolled you, aborting trade!");
+                return;
+            }
+            if (getInvoiceAmount(content) !== Number(sessionStorage.expected_invoice_amount)) {
+                alert("Seller tried to scam you, aborting trade! Expected amount: " + sessionStorage.expected_invoice_amount + " Actual amount: " + getInvoiceAmount(content));
+                return;
+            }
+            var qrdiv = document.createElement("div");
+            qrdiv.append(createQR(content));
+            var qrhtml = qrdiv.innerHTML;
+            var html = qrhtml;
+            html += `<p>${content}</p>`;
+            showModal(html);
+            await waitForDepositAndSweep();
+        }
+    }
+    var timestamp = Math.floor(Date.now() / 1e3);
+    var timeMinusTen = timestamp - 600;
+    var subId = Buffer.from(evrmorejs.ECPair.makeRandom().privateKey).toString("hex");
+    var filter = {
+        kinds: [ offerKind, statusKind ],
+        since: timeMinusTen
+    };
+    var filter2 = {
+        kinds: [ dmKind ],
+        "#p": [ pubKey ],
+        since: timestamp - 5
+    };
+    async function openConnection(conn) {
+        conn.url;
+        var subscription = [ "REQ", subId, filter, filter2 ];
+        conn.url, JSON.stringify(subscription);
+        try {
+            conn.socket.send(JSON.stringify(subscription));
+            conn.url;
+        } catch (e) {
+            conn.url, e.message;
+        }
+    }
+    function wireSocket(conn) {
+        conn.socket.addEventListener("message", function(message) {
+            handleMessage(message, conn);
+        });
+        conn.socket.addEventListener("open", function() {
+            openConnection(conn);
+        });
+    }
+    function connectRelay(url) {
+        var conn = {
+            url: url,
+            socket: new WebSocket(url)
+        };
+        wireSocket(conn);
+        return conn;
+    }
+    function reconnectRelay(conn) {
+        conn.socket = new WebSocket(conn.url);
+        wireSocket(conn);
+    }
+    function broadcastToAllRelays(raw) {
+        var succeededOnAny = false;
+        relayConnections.forEach(function(conn) {
+            if (conn.socket.readyState !== 1) return;
+            try {
+                conn.socket.send(raw);
+                conn.url;
+                succeededOnAny = true;
+            } catch (e) {
+                conn.url, e.message;
+            }
+        });
+        return succeededOnAny;
+    }
+    async function getSignedEvent(event, privateKey) {
+        var eventData = JSON.stringify([ 0, event["pubkey"], event["created_at"], event["kind"], event["tags"], event["content"] ]);
+        event.id = Buffer.from(sha256(eventData)).toString("hex");
+        event.sig = await schnorr.sign(event.id, privateKey);
+        return event;
+    }
+    async function verifyEvent(event) {
+        try {
+            var eventData = JSON.stringify([ 0, event["pubkey"], event["created_at"], event["kind"], event["tags"], event["content"] ]);
+            var computedId = Buffer.from(sha256(eventData)).toString("hex");
+            if (computedId !== event["id"]) return false;
+            return await schnorr.verify(event["sig"], event["id"], event["pubkey"]);
+        } catch (e) {
+            return false;
+        }
+    }
+    function generateHtlc(serverPubkey, userPubkey, pmthash, timelock) {
+        return evrmorejs.script.fromASM(`\n                OP_SIZE\n                ${Buffer.from(evrmorejs.script.number.encode(32)).toString("hex")}\n                OP_EQUALVERIFY\n              \tOP_SHA256\n              \t${pmthash}\n              \tOP_EQUAL\n              \tOP_IF\n                \t${userPubkey}\n              \tOP_ELSE\n                \t${Buffer.from(evrmorejs.script.number.encode(timelock)).toString("hex")}\n                \tOP_CHECKLOCKTIMEVERIFY\n                \tOP_DROP\n                \t${serverPubkey}\n              \tOP_ENDIF\n              \tOP_CHECKSIG\n\n            \t`.trim().replace(/\s+/g, " "));
+    }
+    async function evrmoreRpc(method, params, quiet) {
+        var url = evrRpcBase + "/rpc/";
+        var body = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: method,
+            params: params
+        });
+        var authHeader = "Basic " + btoa("whatever:whatever");
+        if (!quiet) JSON.stringify(params);
+        var text = await postData(url, body, "application/json", "", authHeader);
+        var reply;
+        try {
+            reply = JSON.parse(text);
+        } catch (e) {
+            return {
+                error: {
+                    message: text
+                }
+            };
+        }
+        var failed = reply && reply.error;
+        if (!quiet || failed) if (failed) ;
+        return reply;
+    }
+    async function getBlockheight() {
+        var reply = await evrmoreRpc("getblockcount", []);
+        return Number(reply.result);
+    }
+    async function getRawTxHex(txid) {
+        var reply = await evrmoreRpc("getrawtransaction", [ txid ]);
+        return reply.result;
+    }
+    function isValidInvoice(invoice) {
+        try {
+            return typeof bolt11.decode(invoice) == "object";
+        } catch (e) {
+            return;
+        }
+    }
+    function getInvoiceAmount(invoice) {
+        var decoded = bolt11.decode(invoice);
+        var amount = decoded["satoshis"].toString();
+        return Number(amount);
+    }
+    function createQR(content) {
+        var dataUriPngImage = document.createElement("img"), s = QRCode.generatePNG(content, {
+            ecclevel: "M",
+            format: "html",
+            fillcolor: "#FFFFFF",
+            textcolor: "#000000",
+            margin: 4,
+            modulesize: 8
+        });
+        dataUriPngImage.src = s;
+        dataUriPngImage.id = "qr_code";
+        dataUriPngImage.style.width = "100%";
+        dataUriPngImage.style.maxWidth = "14rem";
+        return dataUriPngImage;
+    }
+    async function sweepingHTLC(txid, txindex, original_quantity_of_sats, new_quantity_of_sats, userPrivkey, serverPubkey, preimage, timelock, useraddress, userPubkey, assetUtxo, asset_name, asset_amount) {
+        var pmthash = Buffer.from(evrmorejs.crypto.sha256(Buffer.from(preimage, "hex"))).toString("hex");
+        var witnessscript = generateHtlc(serverPubkey, userPubkey, pmthash, timelock);
+        Buffer.from(witnessscript).toString("hex");
+        var rawPrevTx = await getRawTxHex(txid);
+        var psbt = new evrmorejs.Psbt({
+            network: network
+        });
+        psbt.setMaximumFeeRate(5e4);
+        psbt.addInput({
+            hash: txid,
+            index: txindex,
+            sequence: 4294967294,
+            nonWitnessUtxo: Buffer.from(rawPrevTx, "hex"),
+            redeemScript: Buffer.from(witnessscript, "hex")
+        });
+        if (assetUtxo) {
+            var rawAssetPrevTx = await getRawTxHex(assetUtxo.txid);
+            psbt.addInput({
+                hash: assetUtxo.txid,
+                index: assetUtxo.vout,
+                sequence: 4294967294,
+                nonWitnessUtxo: Buffer.from(rawAssetPrevTx, "hex"),
+                redeemScript: Buffer.from(witnessscript, "hex")
+            });
+        }
+        psbt.addOutput({
+            address: useraddress,
+            value: Number(new_quantity_of_sats)
+        });
+        if (assetUtxo) psbt.addOutput({
+            address: useraddress,
+            value: 0,
+            asset: {
+                name: asset_name,
+                amount: asset_amount
+            }
+        });
+        var userKeyPair = evrmorejs.ECPair.fromPrivateKey(Buffer.from(userPrivkey, "hex"));
+        psbt.signInput(0, asEvrmoreSigner(userKeyPair));
+        var getFinalScripts = (txindex, input, script) => {
+            var decompiled = evrmorejs.script.decompile(script);
+            if (!decompiled || decompiled[0] !== evrmorejs.opcodes.OP_SIZE) throw new Error(`Can not finalize input #${txindex}`);
+            var p2sh = evrmorejs.payments.p2sh({
+                redeem: {
+                    output: script,
+                    input: evrmorejs.script.compile([ input.partialSig[0].signature, Buffer.from(preimage, "hex") ])
+                }
+            });
+            p2sh.input.toString("hex");
+            return {
+                finalScriptSig: p2sh.input
+            };
+        };
+        psbt.finalizeInput(0, getFinalScripts);
+        if (assetUtxo) {
+            psbt.signInput(1, asEvrmoreSigner(userKeyPair));
+            psbt.finalizeInput(1, getFinalScripts);
+        }
+        return psbt.extractTransaction().toHex();
+    }
+    async function addressOnceHadMoney(address) {
+        var reply = await evrmoreRpc("getaddressbalance", [ {
+            addresses: [ address ]
+        } ]);
+        if (reply.result && reply.result["received"] > 0) return true;
+        return false;
+    }
+    async function waitForMoneyToArriveInAddress(address) {
+        sessionStorage["waiting_for_payment"] = true;
+        var timeoutId = setTimeout(function() {
+            if (!sessionStorage["successful_payment"] && !sessionStorage["alert_sent"]) {
+                modalVanish();
+                alert(`Looks like you didn't pay in time. Please try again.`);
+                sessionStorage["alert_sent"] = true;
+                sessionStorage.removeItem("waiting_for_payment");
+            }
+        }, 48e4);
+        async function isAddressFundedYet(address) {
+            var address_received_money = await addressOnceHadMoney(address);
+            return new Promise(function(resolve, reject) {
+                if (!address_received_money) setTimeout(async function() {
+                    if (!sessionStorage["waiting_for_payment"]) resolve("failure");
+                    var msg = await isAddressFundedYet(address);
+                    resolve(msg);
+                }, 5e3); else {
+                    clearTimeout(timeoutId);
+                    resolve(address_received_money);
+                }
+            });
+        }
+        async function getTimeoutData() {
+            var address_received_money = await isAddressFundedYet(address);
+            return address_received_money;
+        }
+        var returnable = await getTimeoutData();
+        return returnable;
+    }
+    function normalizeUtxo(u) {
+        return {
+            txid: u.txid || u.tx_hash,
+            vout: u.outputIndex !== void 0 ? u.outputIndex : u.tx_pos,
+            amt: u.satoshis !== void 0 ? u.satoshis : u.value
+        };
+    }
+    async function addressReceivedMoneyInThisTx(address) {
+        let reply = await evrmoreRpc("getaddressutxos", [ {
+            addresses: [ address ]
+        } ]);
+        let utxos = reply.result || [];
+        if (!utxos.length) return [ void 0, void 0, void 0 ];
+        let u = normalizeUtxo(utxos[0]);
+        return [ u.txid, u.vout, u.amt ];
+    }
+    function outputHasAssetTail(scriptBuffer) {
+        var decompiled = evrmorejs.script.decompile(scriptBuffer);
+        return !!decompiled && decompiled.indexOf(evrmorejs.opcodes.OP_EVR_ASSET) !== -1;
+    }
+    async function addressReceivedAssetSwapUtxos(address, assetName) {
+        var reply = await evrmoreRpc("getaddressutxos", [ {
+            addresses: [ address ]
+        } ]);
+        var utxos = reply.result || [];
+        var assetReply = await evrmoreRpc("getaddressutxos", [ {
+            addresses: [ address ],
+            assetName: assetName
+        } ]);
+        utxos = utxos.concat(assetReply.result || []);
+        if (utxos.length < 2) return null;
+        var classified = [];
+        for (var i = 0; i < utxos.length; i++) {
+            var u = normalizeUtxo(utxos[i]);
+            var script;
+            if (utxos[i].script) script = Buffer.from(utxos[i].script, "hex"); else {
+                var rawTx = await getRawTxHex(u.txid);
+                script = evrmorejs.Transaction.fromHex(rawTx).outs[u.vout].script;
+            }
+            classified.push({
+                txid: u.txid,
+                vout: u.vout,
+                amt: u.amt,
+                isAsset: outputHasAssetTail(script)
+            });
+        }
+        var assetLeg = classified.filter(function(c) {
+            return c.isAsset;
+        });
+        var evrLeg = classified.filter(function(c) {
+            return !c.isAsset;
+        });
+        if (assetLeg.length !== 1 || evrLeg.length !== 1) return null;
+        return {
+            evrLeg: evrLeg[0],
+            assetLeg: assetLeg[0]
+        };
+    }
+    async function getAddressTxids(address) {
+        let reply = await evrmoreRpc("getaddresstxids", [ {
+            addresses: [ address ]
+        } ]);
+        let list = reply.result || [];
+        return list.map(function(entry) {
+            return entry["transactionid"] || entry;
+        });
+    }
+    async function waitForNewPaymentToAddress(address, knownTxids, expectedAmount) {
+        var tries = 0;
+        async function poll() {
+            let reply = await evrmoreRpc("getaddressutxos", [ {
+                addresses: [ address ]
+            } ]);
+            let utxos = reply.result || [];
+            let match = null;
+            utxos.forEach(function(rawUtxo) {
+                let u = normalizeUtxo(rawUtxo);
+                if (knownTxids.includes(u.txid)) return;
+                if (u.amt === expectedAmount) match = u.txid;
+            });
+            return new Promise(function(resolve) {
+                if (!match) {
+                    tries += 1;
+                    if (tries >= 120) {
+                        resolve(null);
+                        return;
+                    }
+                    setTimeout(async function() {
+                        var msg = await poll();
+                        resolve(msg);
+                    }, 5e3);
+                } else resolve(match);
+            });
+        }
+        return await poll();
+    }
+    async function howManyConfs(txid, quiet) {
+        var reply = await evrmoreRpc("getrawtransaction", [ txid, true ], quiet);
+        if (reply.result && reply.result["confirmations"]) return reply.result["confirmations"];
+        return "0";
+    }
+    async function waitForOneConfirmation(txid) {
+        var tries = 0;
+        while (true) {
+            var isFirstTick = tries === 0;
+            var confs = await howManyConfs(txid, !isFirstTick);
+            if (Number(confs) >= 1) {
+                if (!isFirstTick) await howManyConfs(txid, false);
+                return true;
+            }
+            tries += 1;
+            if (tries >= 30) {
+                await howManyConfs(txid, false);
+                return false;
+            }
+            await new Promise(function(resolve) {
+                setTimeout(resolve, 6e4);
+            });
+        }
+    }
+    function getCompressedPubkeyHexFromPrivkeyHex(privkeyhex) {
+        var pubkey = evrmorejs.ECPair.fromPrivateKey(Buffer.from(privkeyhex, "hex"), {
+            network: network
+        }).publicKey;
+        return Buffer.from(pubkey).toString("hex");
+    }
+    async function getMinFeeRate() {
+        var reply = await evrmoreRpc("estimatesmartfee", [ 1, "CONSERVATIVE" ]);
+        if (!reply.result || !("feerate" in reply.result)) {
+            JSON.stringify(reply);
+            return 5e3;
+        }
+        var feerate_evr_per_kb = reply.result["feerate"];
+        var feerate_per_byte = Math.ceil(feerate_evr_per_kb * 1e8 / 1e3);
+        return feerate_per_byte;
+    }
+    function showModal(content) {
+        $(".modal").innerHTML = `<div style="overflow-y: scroll; max-height: 85vh;">${content}</div>`;
+        $(".modal").innerHTML += `\n          <div style="display: flex; gap: 1rem; justify-content: center; margin-top: 1rem;">\n            <button class="modal-cancel-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: white; color: black;">Cancel</button>\n            <button class="modal-close-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">Close</button>\n          </div>\n        `;
+        $(".modal-cancel-btn").onclick = cancelSwapAttempt;
+        $(".modal-close-btn").onclick = modalVanish;
+        $(".black-bg").style.display = "block";
+        $(".modal").style.display = "block";
+    }
+    function showInfoModal(content) {
+        $(".modal").innerHTML = `<div style="overflow-y: scroll; max-height: 85vh;">${content}</div>`;
+        $(".modal").innerHTML += `\n          <div style="display: flex; justify-content: center; margin-top: 1rem;">\n            <button class="modal-close-btn" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">Close</button>\n          </div>\n        `;
+        $(".modal-close-btn").onclick = modalVanish;
+        $(".black-bg").style.display = "block";
+        $(".modal").style.display = "block";
+    }
+    function customConfirm(html) {
+        return new Promise(function(resolve) {
+            $(".modal").style.maxWidth = "700px";
+            $(".modal").style.padding = "1.5rem";
+            $(".modal").style.textAlign = "left";
+            $(".modal").innerHTML = `\n            <div class="compact-modal-content" style="max-height: 70vh; overflow-y: auto;">${html}</div>\n            <div style="display: flex; gap: 1rem; justify-content: center; margin-top: 1rem;">\n              <button class="custom-confirm-cancel" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: white; color: black;">Cancel</button>\n              <button class="custom-confirm-ok" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">OK</button>\n            </div>\n          `;
+            $(".black-bg").style.display = "block";
+            $(".modal").style.display = "block";
+            function finish(result) {
+                $(".black-bg").style.display = "none";
+                $(".modal").style.display = "none";
+                $(".modal").style.maxWidth = "";
+                $(".modal").style.padding = "";
+                $(".modal").style.textAlign = "";
+                resolve(result);
+            }
+            $(".custom-confirm-ok").onclick = function() {
+                finish(true);
+            };
+            $(".custom-confirm-cancel").onclick = function() {
+                finish(false);
+            };
+        });
+    }
+    function customAlert(html) {
+        return new Promise(function(resolve) {
+            $(".modal").style.maxWidth = "700px";
+            $(".modal").style.padding = "1.5rem";
+            $(".modal").style.textAlign = "left";
+            $(".modal").innerHTML = `\n            <div class="compact-modal-content" style="max-height: 70vh; overflow-y: auto;">${html}</div>\n            <div style="display: flex; justify-content: center; margin-top: 1rem;">\n              <button class="custom-alert-ok" style="padding: 0.5rem 1.3rem; font-size: 0.9rem; cursor: pointer; border: 1px solid black; border-radius: 0.5rem; background: black; color: white;">OK</button>\n            </div>\n          `;
+            $(".black-bg").style.display = "block";
+            $(".modal").style.display = "block";
+            $(".custom-alert-ok").onclick = function() {
+                $(".black-bg").style.display = "none";
+                $(".modal").style.display = "none";
+                $(".modal").style.maxWidth = "";
+                $(".modal").style.padding = "";
+                $(".modal").style.textAlign = "";
+                resolve();
+            };
+        });
+    }
+    async function pushBTCpmt(rawtx) {
+        var reply = await evrmoreRpc("sendrawtransaction", [ rawtx ]);
+        if (!reply || !reply.result) {
+            var reason = reply && reply.error && (reply.error.error && reply.error.error.message || reply.error.message) || "unknown error";
+            throw new Error("failed to broadcast the sweep transaction: " + reason);
+        }
+        return reply.result;
+    }
+    async function postData(url, json, content_type = "", apikey = "", authHeader = "") {
+        var rtext = "";
+        function inner_post(url, json, content_type = "", apikey = "", authHeader = "") {
+            var xhttp = new XMLHttpRequest;
+            xhttp.open("POST", url, true);
+            if (content_type) xhttp.setRequestHeader(`Content-Type`, content_type);
+            if (apikey) xhttp.setRequestHeader(`X-Api-Key`, apikey);
+            if (authHeader) xhttp.setRequestHeader(`Authorization`, authHeader);
+            xhttp.timeout = 15e3;
+            xhttp.send(json);
+            return xhttp;
+        }
+        var data = inner_post(url, json, content_type, apikey, authHeader);
+        data.onerror = function(e) {
+            rtext = "error";
+        };
+        data.ontimeout = function(e) {
+            rtext = "error";
+        };
+        async function isResponseReady() {
+            return new Promise(function(resolve, reject) {
+                if (rtext == "error") resolve(rtext);
+                if (!data.responseText || data.readyState != 4) setTimeout(async function() {
+                    var msg = await isResponseReady();
+                    resolve(msg);
+                }, 50); else resolve(data.responseText);
+            });
+        }
+        var returnable = await isResponseReady();
+        return returnable;
+    }
+    function isValidJson(content) {
+        if (!content) return;
+        try {
+            var json = JSON.parse(content);
+        } catch (e) {
+            return;
+        }
+        return true;
+    }
+    var ASSET_NAME_CHARSET = /^[A-Za-z0-9@$%&*(){}\[\].?:#!_-]+$/;
+    function isValidAssetName(name) {
+        return typeof name === "string" && ASSET_NAME_CHARSET.test(name);
+    }
+    function offerMatchesCoinFilter(coin, isAssetOffer, assetName) {
+        if (!coin) return true;
+        if (coin === "EVR") return !isAssetOffer;
+        return isAssetOffer && assetName === coin;
+    }
+    function offerMatchesSellerFilter(sellerKeysRaw, sellerPubkey) {
+        var sellerKeys = (sellerKeysRaw || "").split(",").map(function(s) {
+            return s.trim();
+        }).filter(Boolean);
+        if (!sellerKeys.length) return true;
+        return sellerKeys.includes(sellerPubkey);
+    }
+    function getTag(event, name) {
+        var tag = (event.tags || []).find(function(t) {
+            return t[0] === name;
+        });
+        return tag ? tag[1] : void 0;
+    }
+    function isHex(h) {
+        if (!h) return;
+        var length = h.length;
+        if (length % 2) return;
+        try {
+            var a = BigInt("0x" + h, "hex");
+        } catch (e) {
+            return;
+        }
+        var unpadded = a.toString(16);
+        var padding = [];
+        var i;
+        for (i = 0; i < length; i++) padding.push(0);
+        padding = padding.join("");
+        padding += unpadded.toString();
+        padding = padding.slice(-Math.abs(length));
+        return padding === h;
+    }
+    function checkHeartbeat() {
+        setTimeout(() => {
+            relayConnections.forEach(function(conn) {
+                if (conn.socket.readyState != 1) reconnectRelay(conn);
+            });
+            bunkerRelayConnections.forEach(function(conn) {
+                if (conn.socket.readyState != 1) reconnectBunkerRelay(conn);
+            });
+            checkHeartbeat();
+        }, 2e3);
+    }
+    checkHeartbeat();
+    function sweepStaleOffers() {
+        setTimeout(() => {
+            var staleThresholdMs = 15 * 60 * 1e3;
+            var now = Date.now();
+            $$(".orderbook > tr[data-last-seen]").forEach(function(row) {
+                if (now - Number(row.getAttribute("data-last-seen")) > staleThresholdMs) row.remove();
+            });
+            sweepStaleOffers();
+        }, 6e4);
+    }
+    sweepStaleOffers();
+    var priceSuggestionResendTimer = null;
+    var priceSuggestionCoin = config.coin || "";
+    function updatePriceSuggestionCoinLabels() {
+        var coin = priceSuggestionCoin || $(".buy-coin-input").value.trim();
+        $$(".buy-coin-label").forEach(function(el) {
+            el.innerText = coin || "Coin";
+        });
+    }
+    if (priceSuggestionCoin) {
+        $(".buy-coin-entry").style.display = "none";
+        $(".buy-coin").innerText = priceSuggestionCoin;
+    } else $(".buy-coin-input").addEventListener("input", updatePriceSuggestionCoinLabels);
+    updatePriceSuggestionCoinLabels();
+    var BLANK_PRICE_SUGGESTION_CONTENT = {
+        coin: "",
+        exchange_rate: null,
+        qty: null,
+        time_utc: ""
+    };
+    function buildPriceSuggestionContent(coin, exchangeRate, qty) {
+        return {
+            coin: coin,
+            exchange_rate: exchangeRate,
+            qty: qty,
+            time_utc: (new Date).toISOString()
+        };
+    }
+    async function sendPriceSuggestionEvent(content) {
+        var priceSuggestionEvent = {
+            content: JSON.stringify(content),
+            created_at: Math.floor(Date.now() / 1e3),
+            kind: priceSuggestionKind,
+            tags: [],
+            pubkey: pubKey
+        };
+        var signedPriceSuggestion = await signEventWithSigner(priceSuggestionEvent);
+        JSON.stringify([ "EVENT", signedPriceSuggestion ]);
+        broadcastToAllRelays(JSON.stringify([ "EVENT", signedPriceSuggestion ]));
+    }
+    function populatePriceSuggestionRow(content) {
+        $(".buy-coin").innerText = content.coin || priceSuggestionCoin || "";
+        $(".buy-rate").innerText = content.exchange_rate ? "1 BTC = " + Number(content.exchange_rate).toLocaleString(void 0, {
+            maximumFractionDigits: 8
+        }) + " " + (content.coin || priceSuggestionCoin || "EVR") : "";
+        $(".buy-qty").innerText = content.qty || "";
+        $(".buy-time").innerText = content.time_utc || "";
+    }
+    function schedulePriceSuggestionResend(coin, exchangeRate, qty) {
+        priceSuggestionResendTimer = setTimeout(async function() {
+            var content = buildPriceSuggestionContent(coin, exchangeRate, qty);
+            await sendPriceSuggestionEvent(content);
+            populatePriceSuggestionRow(content);
+            schedulePriceSuggestionResend(coin, exchangeRate, qty);
+        }, 5 * 60 * 1e3);
+    }
+    $(".broadcast-price-suggestion-btn").onclick = async function() {
+        var coin = priceSuggestionCoin || $(".buy-coin-input").value.trim();
+        if (!isValidAssetName(coin)) {
+            alert("Enter a coin to buy (EVR, or a valid Evrmore asset name) before broadcasting a price suggestion.");
+            return;
+        }
+        var exchangeRate = Number($(".buy-rate-input").value);
+        var qty = Number($(".buy-qty-input").value);
+        if (!(exchangeRate > 0) || !(qty > 0)) {
+            alert("Enter a positive Exchange Rate and Qty before broadcasting a price suggestion.");
+            return;
+        }
+        if (priceSuggestionResendTimer) {
+            clearTimeout(priceSuggestionResendTimer);
+            priceSuggestionResendTimer = null;
+        }
+        var content = buildPriceSuggestionContent(coin, exchangeRate, qty);
+        await sendPriceSuggestionEvent(content);
+        populatePriceSuggestionRow(content);
+        $(".clear-price-suggestion-btn").style.display = "";
+        schedulePriceSuggestionResend(coin, exchangeRate, qty);
+    };
+    $(".clear-price-suggestion-btn").onclick = async function() {
+        if (priceSuggestionResendTimer) {
+            clearTimeout(priceSuggestionResendTimer);
+            priceSuggestionResendTimer = null;
+        }
+        await sendPriceSuggestionEvent(BLANK_PRICE_SUGGESTION_CONTENT);
+        populatePriceSuggestionRow(BLANK_PRICE_SUGGESTION_CONTENT);
+        $(".clear-price-suggestion-btn").style.display = "none";
+    };
+}
+
+function parseConfFile(text) {
+    var result = {};
+    var lines = text.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (line === "" || line[0] === "#") continue;
+        var eqIndex = line.indexOf("=");
+        if (eqIndex === -1) continue;
+        var key = line.slice(0, eqIndex).trim();
+        var value = line.slice(eqIndex + 1).trim();
+        if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"') value = value.slice(1, -1);
+        if (/^-?\d+(\.\d+)?$/.test(value)) value = Number(value);
+        result[key] = value;
+    }
+    return result;
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+    getBuyerConfig().then(function(config) {
+        startSwapService(config);
+    });
+})</script>
+    <div class="black-bg"></div>
+    <div class="modal"></div>
+  </body>
+</html>
