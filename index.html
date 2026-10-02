@@ -1,4 +1,4 @@
-<!-- version=4785746a -->
+<!-- version=03d5f02e -->
 <!-- Copyright (c) 2026 Hans Schmidt - All rights reserved -->
 
 <!DOCTYPE html>
@@ -571,7 +571,7 @@ async function startSwapService(config) {
     var statusKind = config.network === "testnet" ? 30042 : 30043;
     var priceSuggestionKind = config.network === "testnet" ? 10044 : 10045;
     function clearDealSessionState() {
-        [ "htlcInfo", "waiting_for_payment", "alert_sent", "successful_payment", "offerId", "expected_invoice_amount" ].forEach(function(key) {
+        [ "htlcInfo", "waiting_for_payment", "alert_sent", "successful_payment", "offerId", "expected_invoice_amount", "expected_payment_hash", "counterparty_pubkey" ].forEach(function(key) {
             sessionStorage.removeItem(key);
         });
     }
@@ -1059,7 +1059,7 @@ async function startSwapService(config) {
         }
         modalVanish();
         showInfoModal(`\n          <h2 style="margin-top: 0;">You're almost done!</h2>\n          <p>The seller has put your purchase into an HTLC contract locked with your secret.</p>\n          <p>The contract is at address:<br>\n            <span style="font-family: monospace; word-break: break-all;">${htlcArray[0]}</span>\n          </p>\n          <p>created by transaction:<br>\n            <a href="https://evr-rpc-${evrRpcPrefix}.evrmorecoin.org/explorer/#/tx/${txid}" target="_blank" style="font-family: monospace; word-break: break-all;">${txid}</a>\n          </p>\n          <p>After it confirms on the Evrmore blockchain, your secret will be automatically used to open the contract and sweep your purchase into the final address you chose earlier:<br>\n            <span style="font-family: monospace; word-break: break-all;">${useraddress}</span></p>\n          <p>That sweep operation reveals your secret on the blockchain, which the seller will use to collect the Lightning invoice payment you made.</p>\n          <p>This window will close automatically once the sweep transaction confirms on the blockchain.</p>\n          <p>Please wait about 1 minute...</p>\n        `);
-        var broadcastOk = await attemptSweepBroadcast(buildSweepTx);
+        var broadcastOk = await attemptSweepBroadcast(buildSweepTx, htlcArray[5]);
         if (!broadcastOk) {
             sessionStorage["alert_sent"] = true;
             sessionStorage.removeItem("waiting_for_payment");
@@ -1090,9 +1090,16 @@ async function startSwapService(config) {
         })} EVR was transferred on the Evrmore blockchain into the address you specified:<br>\n            <span style="font-family: monospace; word-break: break-all;">${useraddress}</span>\n          </p>`}\n        `);
         window.location.reload();
     }
-    async function attemptSweepBroadcast(buildTx) {
+    var SWEEP_MIN_BLOCKS_BEFORE_TIMELOCK = 5;
+    async function attemptSweepBroadcast(buildTx, timelock) {
         var feeMultiplier = 1;
         while (true) {
+            var height = await getBlockheight();
+            if (height >= Number(timelock) - SWEEP_MIN_BLOCKS_BEFORE_TIMELOCK) {
+                modalVanish();
+                alert("It's too close to this swap's timelock (block " + timelock + ", now " + height + ") to claim your purchase safely: the seller can reclaim these funds from that block on, and claiming now could lose that race while revealing your secret. Not claiming. Your Lightning payment will be returned to your wallet once the seller reclaims its funds.");
+                return false;
+            }
             var built = await buildTx(feeMultiplier);
             try {
                 var sweep_txid = await pushBTCpmt(built.tx_hex);
@@ -1331,6 +1338,8 @@ async function startSwapService(config) {
                     JSON.stringify(message);
                     var encrypted_message = await encryptWithSigner(sellerPubkey, JSON.stringify(message));
                     sessionStorage.expected_invoice_amount = Number(total.toFixed(0));
+                    sessionStorage.expected_payment_hash = hash;
+                    sessionStorage.counterparty_pubkey = sellerPubkey;
                     sessionStorage.offerId = offer_id;
                     var acceptEvent = {
                         content: encrypted_message,
@@ -1354,6 +1363,10 @@ async function startSwapService(config) {
             $(".orderbook").append(row);
         }
         if (kind === dmKind) {
+            if (!sessionStorage.counterparty_pubkey || event.pubkey !== sessionStorage.counterparty_pubkey) {
+                event.pubkey;
+                return;
+            }
             try {
                 content = await decryptWithSigner(event.pubkey, content);
             } catch (e) {
@@ -1374,6 +1387,10 @@ async function startSwapService(config) {
             }
             if (getInvoiceAmount(content) !== Number(sessionStorage.expected_invoice_amount)) {
                 alert("Seller tried to scam you, aborting trade! Expected amount: " + sessionStorage.expected_invoice_amount + " Actual amount: " + getInvoiceAmount(content));
+                return;
+            }
+            if (getInvoicePaymentHash(content) !== sessionStorage.expected_payment_hash) {
+                alert("Seller tried to scam you, aborting trade! The invoice is not locked to your own payment hash, so paying it would not be protected.");
                 return;
             }
             var qrdiv = document.createElement("div");
@@ -1500,6 +1517,10 @@ async function startSwapService(config) {
         } catch (e) {
             return;
         }
+    }
+    function getInvoicePaymentHash(invoice) {
+        var tags = bolt11.decode(invoice).tags || [];
+        for (var i = 0; i < tags.length; i++) if (tags[i].tagName === "payment_hash") return String(tags[i].data).toLowerCase();
     }
     function getInvoiceAmount(invoice) {
         var decoded = bolt11.decode(invoice);
